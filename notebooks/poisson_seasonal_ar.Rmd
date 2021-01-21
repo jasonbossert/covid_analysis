@@ -1,0 +1,1634 @@
+---
+title: "Poisson Timeseries Models"
+date: "2021-01-20"
+slug: poisson_timeseries
+tags:
+- COVID-19
+- Timeseries
+- Bayesian Analysis
+output:
+  html_document:
+    toc: true
+    number_sections: true
+    df_print: paged
+    keep_md: yes
+---
+
+```{r, knitr_options, include=FALSE}
+knitr::opts_chunk$set(comment = NA)
+knitr::opts_chunk$set(fig.path = "figures/covid_19_poisson_seasonal_ar/",
+                      fig.width=12, 
+                      fig.height=4.5, 
+                      dev='svg')
+```
+
+## Introduction
+
+The long term objective for this modelling project is to investigate the relationship between demographic variables such as race, ethnicity, gender, and others and the mortality rates due to COVID-19. The primary dataset that I will be using for this project is the number of deaths per county in the US, tabulated daily. This means that each county is a timeseries of counts of deaths due to COVID-19. Time series models and especially regressions with timeseries is a large subject area, and in this blog post we are going to dive into the basics of timeseries modelling with the added twist of working with count data. 
+
+The importance of using specially designed models for timeseries lies in the typically large autocorrelation between values that occur close together in time. Breaking this down with an example, if we are measuring the temperature during the day, we would expect that the temperature right now is closely related to the temperature ten minutes ago. Another way of saying this is that measurements that we take close together in time are not independent. This autocorrelation or lack of independence between samples close together in time is a blessing and a curse. On one hand, the autocorrelation between samples gives us a lot of information we can use to predict future samples. On the other hand, many regression algorithms assume that all samples are independent, and so do not return reliable parameter estimates and parameter error estimates for autocorrelated timeseries data. In order to use the information stored in an autocorrelated timeseries and still get reliable parameter estimates, we will use a seasonal autoregression model.
+
+A second challenge arises due to the count nature of our data. Most out-of-the-box statistical algorithms assume that the residuals of the model's prediction with respect to the actual data are normally distributed. For medium to large datasets, this is a surprisingly robust assumption, but breaks down for very small datasets, or datasets that are not unbounded and continuous. In our case, count data is bounded by zero on the low end (we can't have -1 death in a day), and is also an integer (we can't have 1.5 deaths in a day). For count data where the lowest count value is much larger than zero, we can often use algorithms that assume the residuals will be normally distributed. However, our datasets has many counts of zero, or close to zero, and our models will have to account for the fact that we are using count data. We will achieve this by introducing a Poisson and Negative-Binomial seasonal autoregressive model.
+
+## Libraries and Data
+
+Before diving into any modelling, I will import the necessary libraries, and take a quick look at some data to make sure that the assumptions I made in the introduction are valid.
+
+### Imports
+
+All of the libraries for the notebook are imported below.
+
+```{r, imports, warning = FALSE, message = FALSE}
+library(tidyverse)
+library(magrittr)
+library(lubridate)
+library(ggpubr)
+library(abind)
+
+library(rstan)
+library(bayesplot)
+library(rstantools)
+library(loo)
+
+library(forecast)
+library(tseries)
+library(urca)
+
+library(cowplot)
+library(gridExtra)
+library(latex2exp)
+library(kableExtra)
+library(scales)
+library(see)
+```
+
+```{r, work_dirs, include = FALSE}
+work_dir <- Sys.getenv("covid_analysis_workdir")
+stan_path <- paste0(work_dir, "/stan_models/")
+fits_path <- paste0(work_dir, "/data/stan_fits/")
+```
+
+We can also load in a couple of extra scripts that have some simply utility functions. As always, the code for these scripts is available on Github here [GITHUB LINK!!!].
+
+```{r, source_files, message = FALSE}
+source(paste0(work_dir,"/scripts/covid_utilities.R"))
+source(paste0(stan_path,"/stan_utility.R"))
+
+theme_set(theme_bw(base_size = 18))
+```
+
+### Data
+
+The first consideration when assessing the data is what variable to model. The two timeseries variables that I  have easy access to are COVID-19 case counts, and COVID-19 death counts. In this project, I will be modelling the COVID-19 death counts. There are a few reasons for this.
+
+1. COVID-19 manifests in some people as a symptomless illness. These people are not likely to be tested, and so the number of reported COVID-19 cases is likely to be low. 
+2. I am modelling COVID-19 in the United States, where testing rates vary wildly across the country. This means modelling cases also needs to include a model for testing rates.
+3. Different counties and states have different reporting standards for the number of cases.
+4. Testing rates, techniques, and reporting standards have changed over time.
+5. As the testing system gets overwhelmed, many obviously ill people are not being tested if they are not in the hospital.
+6. Different tests with different error mechanisms are being used in different situations across the country.
+
+COVID-19 death counts suffer from some of the same problems - notably that different places may attribute a death from COVID-19 to a co-morbidity, artificially deflating mortality numbers. However, COVID-19 death counts are likely to be much more accurate than case counts.
+
+With our tools loaded, we can go ahead and import the daily totals of COVID-19 in the United States. This data file, which comes from a previous blog-post [LINK], includes a lot of demographic information that we are going to strip away for this investigation, leaving us with only the identifying details for each county, a date, and the reported number of COVID-19 cases and deaths. To get a quick idea of what the data looks like we can look at the values for Los Angeles County, CA at the beginning of June.
+
+```{r, county_data_load, include = FALSE}
+county_data_daily_fname <- paste(work_dir, "/data/processed/county_data.csv", sep="")
+raw_data <- read_csv(county_data_daily_fname)
+
+county_data_daily <- raw_data %>%
+  filter(date > ymd("20200301") & date < ymd("20201130")) %>%
+  arrange(geoid) %>%
+  mutate(deaths = deaths_d,
+         cases = cases_d) %>%
+  select(all_of(c("geoid", "state_fips", "county_fips", "name", "date", "deaths", "cases")))
+```
+
+```{r, extract_demographic_data, echo = FALSE}
+demographic_data <- raw_data %>%
+  arrange(geoid) %>%
+  group_by(geoid) %>%
+  filter(row_number() == 1) %>%
+  select(-c(date, cases, deaths, cases_d, deaths_d))
+```
+
+
+```{r, county_data_example, echo = FALSE}
+county_data_daily %>%
+  filter(geoid == "06037") %>%
+  filter((date >= ymd("20200601")) & (date <= ymd("20200605")))
+```
+
+As expected, one of the most populous counties in the country has a decent number of cases and deaths in the middle of the summer. We can now test the assumption that most of the daily totals of deaths in the US are zero by taking a log-log histogram of the deaths due to COVID-19 in the US.
+
+```{r, distributions of deaths, echo = FALSE, fig.width = 8}
+ggplot(county_data_daily, aes(x = deaths)) +
+  geom_point(stat = "count") +
+  scale_x_continuous(trans = "log1p", breaks = c(0, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000)) +
+  scale_y_continuous(trans = "log1p", breaks = c(1, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7),
+                     labels = trans_format("log10", math_format(10^.x))) +
+  theme_bw(base_size = 14) +
+  labs(title = "Observed number of deaths",
+       subtitle = "Number of deaths per county per day",
+       x = "Number of deaths",
+       y = "Number of observed values")
+```
+
+We see that the vast majority of counts are below 5, meaning that we can't assume that the data comes from an unbounded and continuous process. Instead, we are going to have to tackle the problem of creating a model that explicitly addresses the fact that we are dealing with count data. Interestingly, the strong, negative, linear trend of the counts in this log-log plot points towards the data being power-law distributed. Power-law distributions have many interesting properties, and pop-up frequently when dealing with humans in social contexts.
+
+Shifting focus, we can look at a couple of sample timeseries. I want to get a broad sense for what the data looks like, and to do this I'm going to focus on California, and plot the county with the larges number of COVID-19 deaths, the county with the least, and the four counties evenly spaced between those extremes.
+
+```{r, example_timeseries, echo = FALSE}
+split_func <- function(x, by) {
+  r <- diff(range(x))
+  out <- seq(0, r - by - 1, by = by)
+  c(round(min(x) + c(0, out - 0.51 + (max(x) - max(out)) / 2), 0), max(x))
+}
+
+sorted_geoids <- county_data_daily %>%
+  filter(state_fips == "06") %>%
+  group_by(geoid) %>%
+  mutate(d_sum = sum(deaths)) %>%
+  arrange(-d_sum) %>%
+  select(geoid) %>%
+  unique() %>%
+  pull(geoid)
+
+target_geoids <- sorted_geoids[split_func(1:length(sorted_geoids), 
+                                          ceiling(length(sorted_geoids)/5))]
+
+county_data_daily %>%
+  filter(geoid %in% target_geoids) %>%
+  group_by(geoid) %>%
+  mutate(d_sum = sum(deaths)) %>%
+  ungroup() %>%
+  mutate(name = fct_reorder(factor(name), -d_sum)) %>%
+  ggplot(aes(x = date, y = deaths)) +
+  geom_line(size = .4) + 
+  facet_wrap(~name, scale = "free_y", ncol = 2) +
+  theme_bw(base_size = 14) +
+  labs(title = "COVID-19 deaths per day",
+       x = "Date",
+       y = "Deaths")
+```
+
+There is a lot going on in these plots, so I am going to break it down into a couple pieces.
+
+1. As decided previously, while there are some counties like Los Angeles that have a large tally of deaths every day, there are many more counties like Calaveras, Colusa, and Trinity that see an average of 0 or 1 death per day. The timeseries for these counties looks kind of weird, almost more like noisy spikes on a background of zero. These are the counties where creating a model specifically for count data will pay off.
+
+2. The Los Angeles and Kern County timeseries show a pretty obvious seasonality. This should be familiar to anyone that has looked at state or national totals for COVID-19. Studies on the cause of this seasonality have looked at actual time of death records and have found that the weekly oscillations are largely illusory. People are dying from COVID-19 at a relatively consistent rate across the week, but reporting and tabulation of deaths happens more during the work week than the weekends. We have to account for this reporting bias before trying to understand some of the underlying causes of mortality.
+
+3. The seasonal trend disappears once the number of deaths decreases below a certain threshold, like in the Monterey or Calaveras County data, and any semblance of trend disappears below a lower threshold, like the last three counties plotted. Any model we build will have to be able to work with a timeseries of mostly zero values. This can be challenging, as there is just isn't that much useful data to work with.
+
+This leaves me with two conclusions, first, we will need a seasonal component to any model that we build, and second, any model has to default to reasonable values for the regression parameters when there is a lack of data.
+
+## Bayesian Modelling
+
+In the rest of this post, I will be developing a Bayesian model to handle timeseries parameter estimation and regression. Taking a Bayesian approach makes sense with respect to the long term goals of this project - eventually I want to incorporate a spatial model on top of the timeseries model to investigate how demographics influence COVID-19 mortality rates. Using a Bayesian modelling framework will allow me to fluidly combine these two model types. However, there are other reasons to take a Bayesian approach.
+
+Looking at the modeling goals presented, there are a number of ways to go forward. The first is to use a standard timeseries forecasting library like `forecast`. Unfortunately most standard libraries don't play nicely with count data. In R there is a library specifically for count data timeseries called `tscount`. The `tscount` library is powerful, but uses maximum likelihood estimation (MLE) for parameter estimation, which has a few drawbacks compared to a Bayesian approach. First, MLE returns a point estimate for parameters instead of a full posterior distribution. Having a full posterior distribution of the parameters allows us to make more accurate inferences. Second, MLE doesn't allow for priors like a Bayesian model. This is important, as priors are a powerful way to control parameter estimation when a timeseries doesn't contain a lot of information.
+
+Finally, Bayesian models naturally lend themselves to hierarchical modelling. Hierarchical modelling allows us to incorporate more information than would otherwise be available. For example, if we are doing a timeseries regression across US counties, hierarchical modelling allows us to include a timeseries that only has data at the state-level, like state-aggregate restaurant revenue, into the regression. MLE methods can allow for hierarchical modelling, but the parameter and error estimates are known to be biased.
+
+## Notation
+
+Before we begin, I'd like to do a quick review of notation. One of the best ways to think of statistical models is to think about how the data was originally generated. For example, I want a model for how turning the knob on a small space heater increases the room temperature. I generate my data by choosing a couple of different knob settings for the heater, and then measuring the room temperature with a cheap thermometer. My guess is that the room temperature will change linearly with the knob setting, but with an offset from the central air heating. We can write this mathematically as
+
+$$T_{room} = T_{central} + \alpha P_{knob}$$
+
+Where $T_{room}$ is the temperature of the room, $T_central$ is the temperature that the central air heating would keep the room without my space heater, $P_{knob}$ is the position of the knob on the heater, and $\alpha$ is the rate at which changing the position of the knob of the heater changes the temperature of the room. This is a nice linear model and all, but is missing a critical component. Unfortunately, I only have a cheap thermometer to measure the temperature with, and it can't measure the temperature perfectly. We can include an error term, $\epsilon_{therm}$ to explicitly denote the error of the thermometer.
+
+$$T_{room} = T_{central} + \alpha P_{knob} + \epsilon_{therm}$$
+
+Now that we have this error term hanging around at the back of the model, it is important to get a sense for what the error looks like. Here we have to make an assumption about the structure of the errors. I think that my cheap thermometer doesn't have a systematic error, instead, it probably just randomly fluctuates a little about the true mean. I think that these random fluctuation probably follow a Normal distribution, and I can encode this assumption explicitly as such:
+
+$$\epsilon_{therm} \sim \text{N}(0, \sigma_{therm})$$
+
+Where the tilde means "has the distribution of" and the parameter $\sigma_{therm}$ is the standard deviation of the Normal distribution. The above statement can be read as, "the errors from the thermometer are distributed normally about zero with a standard deviation of $\sigma$." From my measurements, I then have three parameters to fit, $T_{central}$, $\alpha$, and $\sigma$.
+
+I can write this model more compactly by moving the regression variables inside the normal distribution. This notation is especially useful for models of the error that don't have a variance parameter that is distinct from the mean parameter, like Poisson models. The model is then:
+
+$$T_{room} \sim \text{N} \big( T_{central} + \alpha P_{knob}, \sigma_{therm} \big)$$
+
+I will use both notations throughout this post. The first notation, adding the $\epsilon$ error term is more traditional while discussing ARMA models, but I find the second notation more explicit and intuitive when dealing with distributions other than the Normal distribution.
+
+## Basic Time-series Modelling
+
+The seasonal autoregressive model that we will be building has two fundamental parts, the autoregression and the seasonal component. We will look at each of these parts in turn.
+
+### Autoregressive Models
+
+At the heart of an autoregressive model is white noise. If, as before, we have an error term that is normally distributed, 
+
+$$\epsilon_t \sim \text{N}(0, \sigma_{\epsilon}^2)$$
+Then we can express a white noise sequence as
+
+$$y_t = \epsilon_t$$
+
+This white noise sequence isn't very interesting. However, if we think it is likely that the timeseries has an autoregressive component, we can add in a regression term where predictions of a variable are made based on the past values of that same variable. The $AR(p)$ model is an autoregressive model of order $p$, where the order of the model indicates how many time steps in the past the model will look. Starting with a first-order $AR(1)$ model, if we have a time series $y_t$ with $t \in [1, T]$ and $T$ is the number of time steps, we can write the $AR(1)$ model:
+
+$$y_t = \psi y_{t-1} + \epsilon_t$$
+
+where $\epsilon_t$ is the error at time $t$. The $AR(1)$ model can be generalized to an $AR(i)$ model by including more lags
+
+$$y_t = \sum_{i=1}^p \psi_i y_{t-i} + \epsilon_t$$
+
+To make the notation a little less cumbersome and to aid in adding a seasonal component in the future, we will introduce the back-shift operator. The back-shift or lag operator $L$ takes whatever value is to the right of it and moves it back by one time step, so $L y_t = y_{t-1}$. To shift a variable back by more than one time step, we can exponentiate the back-shift operator so that $L^n y_t = y_{t-n}$. This allows us to write the $AR(p)$ model as
+
+$$y_t = \sum_{i=1}^p \phi_i L^i y_t + \epsilon_t$$
+
+We can then group all of the $y_t$'s together to write a different formulation for the $AR(p)$ model:
+
+
+$$\bigg( 1-\sum_{i=1}^p \phi_i L^i \bigg) y_t = \epsilon_t$$
+
+If we assign the portion of the equation in parentheses to an operator 
+
+$$\textbf{A}(p) = \bigg( 1-\sum_{i=1}^p \phi_i L^i \bigg)$$
+
+then we can concisely write an autoregressive model as 
+
+$$\textbf{A}(p)y_t = \epsilon_t$$
+
+From this notation, we see that the autoregressive model, or data generating process, is an operation solely on the original timeseries. Other types of autoregressive models, such as moving average models, operate on the innovations, but we're not going to be looking at those in this post.
+
+### Seasonality
+
+The seasonal component of an autoregressive model looks almost exactly the same as the non-seasonal component. Seasonality is the idea that a value more than just one lag behind could be a useful predictor. For example, in the COVID-19 datasets, there is a strong weekly, or 7-day period, seasonal signal. This is because reporting of deaths is done less accurately on weekends than during the weekdays. Therefore, if today is Monday, we'd expect that the number of cases last Monday may actually be a better predictor of deaths today than the value from yesterday. Mathematically, we represent this seasonal autoregression:
+
+$$y_t = \Phi y_{t-7} + \epsilon_t$$
+Where we use capital phi to indicate a seasonal regression parameter. A higher order model can be written as $AR(P)_s$, where $P$ is the seasonal order (capitalized to distinguish it from the non-seasonal component), and $s$ is the seasonal period. The full seasonal model written with lag operators is 
+
+$$y_t = \sum_{i=1}^P\Phi_i L^{si}y_t + \epsilon_t$$
+
+Following the same procedure as the non-seasonal model above, we can define the seasonal autoregression operator, $\textbf{B}^s$,
+
+$$\textbf{B}^s(P) = \bigg( 1-\sum_{i=1}^P \phi_i L^{si} \bigg)$$
+
+This allows us to concisely combine both the seasonal and nonseasonal components. If we start with the white noise equation, $y_t = \epsilon_t$, and then apply both the seasonal and non-seasonal autoregression operators to $y_t$, we get the full model.
+
+$$\textbf{A}(p)\textbf{B}^s (P)y_t = \epsilon_t$$
+
+In shorter notation, we call this a $AR(p)(P)_s$ model. We can write out an $AR(1)(1)_7$ model and then simplify it down to get an idea of what's so special about this model.
+
+$$(1 - \phi_1 L)(1 - \Phi_1 L^7)y_t = \epsilon_t$$
+
+$$(1 - \phi_1 L - \Phi_1 L^7 + \phi_1 \Phi_1 L^8) y_t = \epsilon_t$$
+$$y_t = \phi_1 y_{t-1} + \Phi_1 y_{t-7} - \phi_1 \Phi_1 y_{t-8} + \epsilon_t$$
+
+This equations shows an important feature about the seasonal model, the interaction term $-\phi_1 \Phi_1$. This term exist because we have assumed that there are different physical processes behind the non-seasonal autoregression and the seasonal component, and that these processes interact. We have to subtract out this interaction term in order to keep a clear interpretation of $\phi_1$ and $\Phi_1$. We can see the difference in physical mechanism in our COVID-19 data:
+
+1. Non-seasonal. The number of deaths today is related to the number of deaths yesterday due to proximity in time
+
+2. Seasonal. The number of deaths today is related to the number of deaths a week ago, beyond what is captured by the non-seasonal term, due to administrative effects that under-report fatalities over the weekend in most counties.
+
+We can write this in a manner that will make it a little easier to translate into a model:
+
+$$y_t \sim \text{Normal}(\nu_t, \sigma_\epsilon)$$
+$$\nu_t = \mu + \phi_1 y_{t-1} + \Phi_1 y_{t-7} - \phi_1 \Phi_1 y_{t-8}$$
+
+### Notation for Linear Models
+
+A common shorthand for linear models is as follows:
+
+$$\vec{y} = \textbf{X}\vec{\beta} + \vec{\epsilon}$$
+
+The term $\textbf{X}$ is called the design matrix, the vector $\vec{\beta}$ is the vector of regression parameters, and $\epsilon$ is the error, as before. This works well for linear regression were every column of $\textbf{X}$ gets its own regression parameter from $\vec{\beta}$, but can't accommodate terms from our autoregression model like $-\phi_1 \Phi1 y_{t-8}$. We'll introduce an extended parameter vector $\vec{\beta}'$ that has an additional term. To be explicit, our two parameter vectors for the $AR(1)(1)_7$ model are:
+
+$$\vec{\beta} = [\mu, \phi_1, \Phi_1]$$
+$$\vec{\beta}' = [\mu, \phi_1, \Phi_1, -\phi_1 \Phi_1]$$
+
+The distinction between $\vec{\beta}$ and $\vec{\beta}'$ is important. We use $\vec{\beta}'$ while writing the model in order to include the autoregression cross-terms, but use $\vec{\beta}$ when setting priors because $\vec{\beta}$ has each parameter once and we don't want to set any extra priors unintentionally. We will refer to the individual parameters by indexing into $\vec{\beta}$. For example, the intercept is $\beta_1$, the non-seasonal autoregression parameter is $\beta_2$, and the seasonal autoregression parameter is $\beta_3$.
+
+All of the models presented in this post will be linear regressions of lagged count variables. We'll initially use the lagged counts of deaths, but eventually bring in lagged count of cases as a covariate. We always use lagged values so as not to violate causality - it doesn't make sense to use the number of deaths tomorrow to predict the number of deaths tomorrow. Because all of the values are lagged, we will be calling the design matrix $\textbf{L}$. The design matrix for the $AR(1)(1)_7$ model is
+
+$$\textbf{L} = [\vec{1}, \vec{y}_{t-1}, \vec{y}_{t-7}, \vec{y}_{t-8}]$$
+
+And the entire $AR(1)(1)_7$ model can be written
+
+$$\vec{y} \sim \text{Normal}(\textbf{L}\vec{\beta}', \sigma_\epsilon)$$
+
+### Stationarity and Differencing
+
+One topic that I have so far avoided addressing is stationarity. A time series is stationary if it lacks in obvious trend. More specifically, a timeseries is stationary if the properties of the timeseries are the same regardless of what time that series is observed at. It is important for timeseries to be stationary before we start any analysis for two reasons. First, the $ARMA$ model we have developed can only be used on stationary timeseries. This is enforced by limiting the constants to lie between -1 and 1, which is necessary to ensure that parameter estimates are stable. If we do not apply this restriction, there are potentially many, nearly equivalent optimums for the parameters, which causes our Monte-Carlo sampler to struggle. 
+
+Second, regression with timeseries that have a trend easily leads to spurious correlations. This is because many timeseries have similar trends, regardless of whether or not they are causally related.
+
+One way to make a non-stationary time series stationary is to difference the time series. Mathematically, we can represent the differenced timeseries as $y'_t = y_t - y_{t-1}$. If there is a constant trend, this differencing will cancel the trend, leaving a stationary timeseries. 
+
+However, differencing an already stationary timeseries can cause its own set of problems. This is called over-differencing. Over-differenced timeseries can amplify noise above the level of any real signal and make predictions less reliable. Over-differencing can also introduce a strange correlation structure into the timeseries, creating large, noisy oscillations.
+
+We can see how differencing can take a trending timeseries and make it stationary, as well as how over-differencing affects the signal by generating a random timeseries and  then adding a linear trend. In theory, a single difference is all it takes to make this a perfectly stationary timeseries. Below I've plotted the original time series as well as the first three differences.
+
+
+```{r, differencing_example, echo = FALSE, warning = FALSE}
+set.seed(1)
+Ts <- 100
+t <- seq(0, 1, length.out = Ts)
+x <- rnorm(Ts)
+trend <- 2 * t
+y = trend + cumsum(x)
+dats <- tibble(t = t, x = x, trend = trend, y_0 = y) %>%
+  mutate(y_1 = y - lag(y, 1),
+         y_2 = y - 2*lag(y, 1) + lag(y,  2),
+         y_3 = y - 3*lag(y, 1) + 3*lag(y, 2) - lag(y, 3),
+         #y_4 = y - 4*lag(y, 1) + 6*lag(y, 2) - 4*lag(y, 3) + lag(y, 4),
+         #y_5 = y - 5*lag(y, 1) + 10*lag(y, 2) - 10*lag(y, 3) + 5*lag(y, 4) - lag(y, 5)
+         )
+
+dats %>%
+  pivot_longer(cols = starts_with("y"), names_to = "diff", values_to = "values") %>%
+  mutate(diff = paste0(str_sub(diff, 3), " Differences")) %>%
+  ggplot(aes(x = t, y = values, group = diff)) +
+  geom_line() + 
+  facet_wrap(~diff, ncol = 2) +
+  theme_bw(base_size = 14) +
+  labs(title = "",
+       x = "",
+       y = "Value")
+```
+
+We can see that while the first difference is nice and stationary, the higher differences add noise and start oscillating badly.
+
+We can turn to our data with an eye to understanding if we are working with stationary data or not. In order to do this we are going to look at statistical tests for stationarity. While looking at the COVID-19 data, there are a few very important caveats to keep in mind:
+
+1. Count data, by definition, has a positive mean, and CANNOT look like a random walk centered at zero.
+2. Count data tends to be heteroskedastic, meaning that the variance tends to change with the mean.
+3. Looking at multiple statistical tests artificially inflates the number of statistically significant results unless a correction is made to the significance threshold.
+
+Overall, I would expect standard statistical measures to overestimate the prevalence of non-stationary timeseries in our dataset. We can use a KPSS test on each county to determine if the county's timeseries is stationary. The null hypothesis of the KPSS test is that the timeseries is stationary, while the alternative hypothesis is non-stationarity. We can look at the KPSS test for Los Angeles County:
+
+```{r, kpss_example}
+la_kpss <- ur.kpss(filter(county_data_daily, geoid == "06037")$deaths)
+summary(la_kpss)
+```
+
+The important values here is the test statistic, and the significance level critical values. We see that the test statistic is much larger than the 1% critical value, and so determine that Los Angeles County's timeseries is not stationary. We can perform this test for all counties in the US, and plot them in a histogram with the 1% threshold and above highlighted.
+
+```{r, kpss_all_data, echo = FALSE, message = FALSE}
+adf_p_df <- county_data_daily %>%
+  group_by(geoid) %>%
+  summarize(sum_d = sum(deaths),
+            kpss_val = if_else(sum_d > 0, ur.kpss(deaths)@teststat, 0)) %>%
+  filter(sum_d > 0)
+```
+
+
+```{r, kpss_value_hist, echo = FALSE}
+ggplot() +
+  geom_rect(aes(xmin = la_kpss@cval[4], xmax = Inf, ymin = 0, ymax = Inf), fill = "orangered", alpha = 0.2) +
+  geom_histogram(data = adf_p_df, aes(x = kpss_val), bins = 101) +
+  theme_bw(base_size = 14)
+```
+
+We can see that while many timeseries are probably non-stationary, many probably aren't. Since my goal is to create a single model that will apply to all timeseries, I have to decide whether to difference or not. Overall, I are not going to include differencing terms for a couple reasons:
+
+1. The repeated KPSS tests overestimate how many timeseries are non-stationary.
+2. I want a single model for all timeseries and don't want to over difference.
+3. It will make direct modelling of the Poisson timeseries easier, later.
+
+### Model Identifiability
+
+Model identifiability is the idea that a model, along with the data to be used for that model, contain enough information to estimate the free parameters of the model. Whether or not a model is identifiable is an interplay between the model and the data (and the priors for Bayesian models). Our autoregressive models become unidentifiable when there are no deaths. If $y_t$ is all zero, then $y_{t-1}$ is also all zero. Therefore $\beta_2 y_{t-1}$ is zero no matter what value $\beta_2$ takes. Given the data, the model can't identify the parameter $\beta_2$ because it is being multiplied by zero. The solution is to not model autoregressive terms for counties that do not have any deaths. However, we can still model covariate regression terms for these counties.
+
+### Example
+
+Now that we have the groundwork for an autoregressive model to be built, it would be good to see how one works in practice. As mentioned previously, I'll be building a Bayesian autoregressive model using the probabalistic programming language Stan. I'll include important parts of the Stan code and discuss them. The full Stan programs can be found on Github [[GITHUB LINK]]. In this example I will be programming the $AR(1)(1)_7$ model discussed earlier.
+
+```{r, compile_normal_ar1_s1, cache = TRUE, message = FALSE, results = 'hide'}
+normal_ar1_s1_path <- paste0(stan_path, "normal_ar1_s1.stan")
+normal_ar1_s1_model <- stan_model(normal_ar1_s1_path)
+```
+
+The first section of Stan program that I am going to show is the `transformed parameters`, where the extended parameter vector $\vec{\beta}'$ is constructed. Next, the mean vector `nu`, which contains the estimate for the mean at time $t \in [1,T]$, is defined.
+
+```{r, erite_normal_trans_params}
+write_stan_chunk(normal_ar1_s1_path, "transformed parameters")
+```
+
+The model block of the Stan program sets priors for all of the parameters, and contains the likelihood definition, where the model is tied back to the data. Here, I set priors for $\sigma$ to a pre-calculated scale, and $\vec{\beta}$ to be variables that are read in when the program starts. The likelihood definition is the final line, and states that the likelihood of observing `y` is normally distributed around `nu` with a standard deviation of `sigma`. 
+
+```{r, write_normal_model}
+write_stan_chunk(normal_ar1_s1_path, "model")
+```
+
+With the model built, all that is left is to isolate the timeseries we want to model, and choose suitable scales for the priors for all the parameters. For this example, I'll be focusing on Los Angeles County. LA County has a large number of people, and so the timeseries has interesting and obvious features. Later I'll verify that the model performs equally well for less featured timeseries.
+
+Prior choice is a deep subject in Bayesian modelling, but here our choices are relatively simple:
+
+1. $\beta_1$: the intercept. The prior for $\beta_1$ is set so that there is likely very little trend in the data. This reflect a belief that the data is mostly stationary, and doesn't exhibit a strong linear trend.
+2. $\beta_2$: the non-seasonal autoregression. The prior for $\beta_2$ sets the scale for all the autoregression parameters. For a stationary timeseries, there are constraints on the values of $\beta_2$ so that the timeseries does not have uncontrolled growth. Usually,  the parameters are at least bounded between -1 and 1. Including these constraints explicitly is challenging, and instead, I like to set a regularizing prior to keep the parameter values close to zero unless there is substantial evidence otherwise.
+3. $\beta_3$: the seasonal autoregression. The prior for $\beta_3$ is set to the same values as $\beta_2$, indicating a belief that the seasonal part of the model is likely to be about as important as the non-seasonal part.
+4. $\sigma$: the error scale. We should be able to analytically calculate the value of $\sigma$, assuming the errors are normally distributed. In that case, $\sigma$ will be the mean of absolute change in value from one time step to the next:
+$$\sigma = \frac{1}{T-1}\sum_{i=1}^{T-1} |y_{i+1} - y_i|$$
+We set the width of the prior distribution of $\sigma$ to this value, assuming that the best fit distribution is not too far off.
+
+```{r, normal_data_prep}
+y <- county_data_daily %>%
+  filter(geoid == "06037") %>%
+  select(deaths) %>%
+  as.matrix() %>%
+  drop()
+
+times <- county_data_daily %>%
+  filter(geoid == "06037") %>%
+  select(date)
+
+normal_ar1_s1_data <- list(
+  "T" = length(y),
+  "y" = y,
+  
+  "betas_center" = c(0, 0, 0),
+  "betas_scale" = c(0.1, 0.2, 0.2)
+  )
+```
+
+Stan finds the best parameters through a Hamiltonian Monte Carlo (HMC) sampler. In brief, this algorithm wanders - intelligently - through phase space until it finds the best set of parameters. Thankfully, Stan has a robust implementation of HMC, which we call, and then sit back and wait for the results to pour in. 
+
+```{r, normal_fit, results = 'hide'}
+normal_ar1_s1_fit_name <- paste0(fits_path, "normal_ar1_s1.rds")
+
+if (file.exists(normal_ar1_s1_fit_name)) {
+  normal_ar1_s1_fit <- readRDS(normal_ar1_s1_fit_name)
+} else {
+  normal_ar1_s1_fit = sampling(normal_ar1_s1_model, data = normal_ar1_s1_data, 
+                               chains = 4, cores = 1, iter = 2000, thin = 1, warmup = 1000,
+                               seed = 12345, save_warmup = FALSE)
+  saveRDS(normal_ar1_s1_fit, normal_ar1_s1_fit_name)
+}
+```
+
+After fitting the model, we check if the model had any problems, and see that there are no indication of problems.
+
+```{r, normal_diagnostic}
+check_hmc_diagnostics(normal_ar1_s1_fit)
+```
+
+```{r, normal_post_summary, cache = TRUE, echo = FALSE}
+normal_ar1_s1_post <- rstan::extract(normal_ar1_s1_fit)
+normal_ar1_s1_summary <- summary(normal_ar1_s1_fit, pars = c("sigma", "betas"))$summary
+```
+
+One unique and valuable aspect of Bayesian modelling is that it returns a full posterior estimate of the parameters instead of just point estimates. This gives us more information about the model fit. For an example, we'll look at the the scatter-plot between $\beta_2$ and $\beta_3$, the regression coefficients for the non-seasonal and seasonal autoregression, respectively. Ideally, we would like to see a scatter-plot with no correlations. This would mean that the non-seasonal and seasonal lagged timeseries are completely independent. In reality, they are somewhat dependent with a negative correlation. This makes sense as the seasonal and non-seasonal lagged timeseries contain similar information - as one regression coefficient goes up, the other must go down to generate the same estimate.
+
+```{r, normal_phis_scatter, echo = FALSE, fig.width = 8}
+tibble(phi_1 = normal_ar1_s1_post$betas[,2], phi_7 = normal_ar1_s1_post$betas[,3]) %>%
+  ggplot(aes(x = phi_1, y = phi_7)) +
+  geom_point(color = "black", alpha = 0.2, size = 2) + 
+  theme_bw(base_size = 14) +
+  labs(title = "Regression coefficient scatter-plot",
+       x = TeX('$\\beta_2$'),
+       y = TeX('$\\beta_3$'))
+```
+
+Looking at the mean and spread of each parameter in the model gives us an idea of what parameters are important.
+
+```{r, normal_params, echo = FALSE}
+ normal_ar1_s1_summary %>%
+  as_tibble(rownames = NA) %>%
+  mutate(Variable = rownames(.)) %>%
+  select(Variable, everything(), -se_mean) %>%
+  mutate_if(is.numeric, format, digits = 2, nsmall = 1) %>%
+  kbl() %>%
+  kable_classic(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+We see that $\beta_1$ is close to zero, as we anticipated. The mean value for $\sigma$ is higher than we initially thought. This may indicate that there is a little more going on with the variance of the series than we assumed when building the model. The value for $\beta_2$ is small, and is not significantly different from zero, indicating that the previous day is not a significant predictor for the number of COVID-19 deaths. The value for $\beta_3$ is very large, indicating that the number of COVID-19 deaths the previous week is a very significant predictor of number of COVID-19 deaths today.
+
+During the HMC sampling, the Stan model also generated a posterior predictive distribution. The posterior predictive values are a distribution of fit values for the data that we modeled. We can compare the fitted values with the observed values by plotting the mean on the posterior predictive distribution along with the observed values. Adding in band for the interquartile range (50% confidence interval) and the 95% confidence interval gives us some idea of the distribution of the posterior predictive at each time step.
+
+```{r, ribbon_plot_formatter, echo = FALSE}
+ribbon_plot2 <- function(y_pred, y, title) {
+  ribbon_plot(y_pred, times$date, as.numeric(y)) +
+  theme_bw(base_size = 18) +
+  labs(title = title,
+       x = "Date",
+       y = "Daily deaths")
+}
+```
+
+
+```{r, normal_post_pred, echo = FALSE, warning = FALSE}
+plt_normal_ar1_s1 <- ribbon_plot2(normal_ar1_s1_post$y_pred, 
+                                 as.numeric(normal_ar1_s1_data$y),
+                                 "Normal Error Model Predictions")
+plt_normal_ar1_s1
+```
+
+The above plot is a little dense after April. We can zoom in to specifically look at July and August to get a better sense of what is going on in the weekly oscillations.
+
+```{r, zoom_func, echo = FALSE}
+zoom_plot <- function(plot) {
+  plot + xlim(ymd("20200701"), ymd("20200831"))
+} 
+```
+
+
+```{r, normal_zoom_post_pred, echo = FALSE, warning = FALSE}
+plt_normal_ar1_s1_zoom <- zoom_plot(plt_normal_ar1_s1)
+plt_normal_ar1_s1_zoom
+```
+
+These posterior plots highlight that the model is working well, but also explicitly show some serious problems. First, the positives:
+
+1. The seasonality is well captured by our autoregressive model. In particular, looking at the month of August, the model matches the observed data remarkably well. For such a complex dataset, having a 4-parameter model work so well is very rewarding and highlights the power of autoregressive models.
+2. The width of the 50% interval and 95% interval appear to be reasonable after May. They are neither far too small or far too large.
+3. The overall trend of the model is captured well. Other than in April, where significant numbers of cases are just starting, the observed data never leaves the model behind.
+
+Now for some of the critical problems that must be addressed:
+
+1. The model places significant amounts of probability at negative values, especially in March and April. It is nonphysical to have negative numbers of deaths due to COVID-19 on any given day. This is a fundamental flaw in the model.
+2. The 50% and 95% intervals are completely unreasonable for March and April. This is an artifact of having a single, constant variance for all time. The data displays a large amount of heteroskedasticity, and the models needs to account for that.
+
+## Poisson ARMA Model
+
+Both of the problems with the Normal error model above can be fixed by moving to a Poisson error model. The Poisson distribution is a non-negative distribution, and so cannot predict values that fall below zero. Additionally, the variance of the Poisson distribution is the same as the mean, so it is an inherently heteroskedastic distribution.
+
+### Avoiding Negative Numbers
+
+Because the Poisson distribution is positive, any models that use it have to be careful to not allow the predicted value to become negative. In the current model, if $\phi_1$ or  $\Phi_1$ are negative, then there is a possibility than the prediction for $y_t$ is negative. This isn't consistent with our ideal of modelling $y_t$ as only positive, so we will need to rethink how we create an autoregressive model using a Poisson distribution.
+
+There are a number of ways to create a Poisson autoregressive model. I will be using ideas from Poisson GLMs to create a coherent model. Poisson GLMs use an exponential transform in order to take continuously distributed data and transform it to be only positive. This allows us to immediately write our new model:
+
+$$y_t \sim \text{Poisson}(\lambda_t)$$
+$$\lambda_t = \exp(\nu_t)$$
+$$\nu_t = \textbf{L}\vec{\beta}'$$
+
+Where the design matrix has changed a little:
+
+$$\textbf{L} = [\vec{1}, \log(\vec{y}_{t-1}+1), \log(\vec{y}_{t-7}+1), \log(\vec{y}_{t-8}+1)]$$
+
+We perform a log-plus-one transformation of the count data so that it stays on the same scale as $y_t$. Overall, this turns the additive model into a multiplicative model. We can see this by explicitly writing out $\lambda_t$:
+
+$$\lambda_t = e^{\beta_1} (y_{t-1} + 1)^{\beta_2} (y_{t-7} + 1)^{\beta_3} (y_{t-8} + 1)^{-\beta_2 \beta_3}$$
+
+This formulation ensures that $\lambda_t$ is positive and also allows the regression coefficients to be positive or negative. The downside is that the regression coefficients are now much harder to interpret.
+
+### Example
+
+We can see how a Poisson model handles the data by making a few small changes. A log-plus-one transformation is added in the `transformed parameters` block, the parameter `sigma` is removed because it is unnecessary, and the sampling statement is changed to `poisson_log`, which automatically exponentiates the argument.
+
+```{r, compile_poisson, cache = TRUE, results = 'hide', message = FALSE, results = 'hide'}
+poisson_ar1_s1_path <- paste0(stan_path, "poisson_ar1_s1.stan")
+poisson_ar1_s1_model <- stan_model(poisson_ar1_s1_path)
+```
+
+```{r, write_poisson_trans_params_model}
+write_stan_chunk(poisson_ar1_s1_path, "transformed parameters")
+write_stan_chunk(poisson_ar1_s1_path, "model")
+```
+
+Setting the prior on the intercept requires a little more thought now. Instead of adding an intercept, we are now multiplying by the constant $e^{\beta_1}$. Naively, I would expect this constant to be near 1, but I'm not really sure. So I'll set the center for this prior to zero ($e^0 = 1$) with a standard deviation of 0.3. We can generate the data:
+
+```{r, poisson_data}
+y = county_data_daily %>%
+  filter(geoid == "06037") %>%
+  select(deaths) %>%
+  as.matrix() %>%
+  drop()
+
+poisson_ar1_s1_data <- list(
+  "T" = length(y),
+  "y" = y,
+  
+  "betas_center" = c(0, 0, 0),
+  "betas_scale" = c(.3, 0.2, 0.2)
+)
+```
+
+And then fit the model:
+
+```{r, poisson_fit, results = 'hide'}
+poisson_ar1_s1_fit_name <- paste0(fits_path, "poisson_ar1_s1.rds")
+
+if (file.exists(poisson_ar1_s1_fit_name)) {
+  poisson_ar1_s1_fit <- readRDS(poisson_ar1_s1_fit_name)
+} else {
+  poisson_ar1_s1_fit = sampling(poisson_ar1_s1_model, data = poisson_ar1_s1_data, 
+               chains = 4, cores = 1, iter = 4000, thin = 1, warmup = 3000,
+               seed = 12345, save_warmup = FALSE)
+  saveRDS(poisson_ar1_s1_fit, poisson_ar1_s1_fit_name)
+}
+```
+
+As usual, after the fit we check to make sure the HMC sampler didn't run into any problems.
+
+```{r, poisson_diagnostic}
+check_hmc_diagnostics(poisson_ar1_s1_fit)
+```
+
+```{r, poisson_post_summary, cache = TRUE}
+poisson_ar1_s1_post <- rstan::extract(poisson_ar1_s1_fit)
+poisson_ar1_s1_summary <- summary(poisson_ar1_s1_fit, pars = c("betas"))$summary
+```
+
+We can run the Stan program with the same data as the normal model and it converges well. The resulting parameters show a similar pattern to the normal model. The seasonal parameter is more important than the non-seasonal, but this time the non-seasonal component is significant. 
+
+```{r, poisson_fit_params, echo = FALSE}
+ poisson_ar1_s1_summary %>%
+  as_tibble(rownames = NA) %>%
+  mutate(Variable = rownames(.)) %>%
+  select(Variable, everything(), -se_mean) %>%
+  mutate_if(is.numeric, format, digits = 2, nsmall = 1) %>%
+  kbl() %>%
+  kable_classic(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+```{r, poisson_pairs, cache = TRUE, include = FALSE, eval = FALSE}
+np = nuts_params(poisson_ar1_s1_fit)
+mcmc_pairs(poisson_ar1_s1_fit, pars = c("betas[1]", "betas[2]", "betas[3]"), np = np)
+```
+
+To see what is going on we'll again look at posterior plots of the predicted value compared to the observed value for the whole timeseries. 
+
+```{r, poisson_post_pred, echo = FALSE, warning = FALSE}
+plt_poisson_ar1_s1 <- ribbon_plot2(poisson_ar1_s1_post$y_pred, 
+                                   as.numeric(poisson_ar1_s1_data$y), 
+                                   "Poisson Error Model Predictions")
+plt_poisson_ar1_s1
+```
+
+The first and most obvious observation is that the model no longer predicts negative values at any time. However, the model doesn't really predict any zero values either! Once again, we can zoom in on the July through August time period to look at the weekly oscillations in more depth.
+
+```{r, poisson_zoom_post_pred, echo = FALSE, warning = FALSE}
+plt_poisson_ar1_s1_zoom <- zoom_plot(plt_poisson_ar1_s1)
+plt_poisson_ar1_s1_zoom
+```
+
+This plot really highlights the problem with the Poisson model. What jumps out immediately is that the variance is far too low. The observed data is regularly out of the 95% interval. This isn't good enough. Thankfully, we have a hint of where to go. The variance is obviously too low, with the error bands being far too narrow, and no predictions of zero counts, even at the beginning of the time series. We need to decouple the variance from the mean, which requires moving away from the Poisson distribution.
+
+## Negative Binomial AR Model
+
+The phenomenon of needing a larger variance than the mean when using a Poisson distribution is called over-dispersion - the data we are trying to model has a larger dispersion than the Poisson model can handle. In order to accommodate the over-dispersion, we will move on to a negative binomial model.
+
+### Tackling Over-dispersion
+
+The negative binomial model handles over-dispersion by introducing a new parameter called $\phi$. The negative binomial distribution creates over-dispersion by mixing a Poisson distribution and a gamma distribution. This means that the rate parameter for the Poisson distribution, $\theta$, is first chosen from a gamma distribution. The model then looks something like:
+
+$$y \sim \text{Poisson}(\theta)$$
+$$\theta \sim \text{Gamma}(\frac{\lambda^2}{\phi - \lambda}, \frac{\phi}{\lambda} - 1)$$
+
+Where $\lambda$ is the mean of the distribution, and the variance is 
+
+$$\text{Var}[y] = \lambda + \frac{\lambda^2}{\phi}$$
+
+We can summarize this mixture as a single distribution:
+
+$$y \sim \text{NB2}(\lambda, \phi)$$
+
+This is called the alternative parameterization (hence the 2 in $\text{NB2}$) of the negative binomial distribution. This characterization is used in regression modelling because it is a location-scale distribution - the first parameter is the location, and the second parameter is the scale. The original negative binomial distribution is not a location-scale distribution and is not regularly used for regression. The parameters for the gamma distribution above are messy specifically because we want to end up with the location-scale characterization of the negative binomial.
+
+### Example
+
+The primary difference between the negative binomial model and the Poisson model is the introduction of an over-dispersion parameter $\phi$. As the over-dispersion parameter goes to infinity, $\phi \rightarrow \infty$, the variance approaches $\lambda$, recovering the original Poisson model. Ideally, we would like to set our prior on $\phi$ to indicate our prior belief that $y$ is Poisson distributed. In other words, we want to set our prior with significant probability mass near infinity. This is not numerically possible, so instead, we set a prior on the inverse of $\phi$ to be close to zero:
+
+$$\frac{1}{\phi} \sim \text{Normal}^+(0, \phi_{scale})$$
+
+Then the dispersion parameter is included in the model and we can look at how the additional dispersion affects our results. As usual, we prepare the data, and then run the Bayesian inference.
+
+```{r, compile_negbin_11, cache = TRUE, results = 'hide', message = 'hide', results = 'hide'}
+negbin_ar1_s1_path <- paste0(stan_path, "negbin_ar1_s1.stan")
+negbin_ar1_s1_model <- stan_model(negbin_ar1_s1_path)
+```
+
+```{r, negbin_11_data}
+y = county_data_daily %>%
+  filter(geoid == "06037") %>%
+  select(deaths) %>%
+  as.matrix() %>%
+  drop()
+
+negbin_ar1_s1_data <- list(
+  "T" = length(y),
+  "y" = y,
+  
+  "betas_center" = c(0, 0, 0),
+  "betas_scale" = c(.3, 0.2, 0.2),
+  "inv_phi_alpha" = 2,
+  "inv_phi_beta" = 0.5
+)
+```
+
+```{r, negbin_11_fit, results = 'hide'}
+negbin_ar1_s1_fit_name <- paste0(fits_path, "negbin_ar1_s1.rds")
+
+if (file.exists(negbin_ar1_s1_fit_name)) {
+  negbin_ar1_s1_fit <- readRDS(negbin_ar1_s1_fit_name)
+} else {
+  negbin_ar1_s1_fit = sampling(negbin_ar1_s1_model, data = negbin_ar1_s1_data, 
+               chains = 4, cores = 1, iter = 2000, thin = 1, warmup = 1000,
+               seed = 12345, save_warmup = FALSE)
+  saveRDS(negbin_ar1_s1_fit, negbin_ar1_s1_fit_name)
+}
+```
+
+```{r, negbin_11_diagnostic}
+check_hmc_diagnostics(negbin_ar1_s1_fit)
+```
+
+```{r, negbin_11_summary, cache = TRUE, echo = FALSE}
+negbin_ar1_s1_summary <- summary(negbin_ar1_s1_fit, pars = c("inv_phi", "betas"))$summary
+```
+
+The negative binomial model shows the same pattern as the normal model. The previous week is more important than the previous day in terms of predicting COVID-19 deaths. This agrees with the visually plotted values, as there is a strong weekly trend. The inverse dispersion parameter, `inv_disp`, is close to one, which means that the variance is very nearly $\lambda + \lambda^2$. This addition of $\lambda^2$ is huge, and gives the model a lot of flexibility to find the best values for the seasonal and non-seasonal parameters.
+
+```{r, negbin_11_fit_params, echo = FALSE}
+negbin_ar1_s1_summary %>%
+  as_tibble(rownames = NA) %>%
+  mutate(Variable = rownames(.)) %>%
+  select(Variable, everything(), -se_mean) %>%
+  mutate_if(is.numeric, format, digits = 2, nsmall = 1) %>%
+  kbl() %>%
+  kable_classic(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+The posterior predictive plots show the opposite problem from the Poisson model - the variance seems way too large! The error bars dwarf the range of the actual data. This is a common problem with negative binomial models with a constant over-dispersion parameter. Sometimes there is an erroneously large prediction and because the variance includes the square of the prediction, the prediction intervals become enormous. 
+
+```{r, negbin_11_post_pred, echo = FALSE, warning = FALSE}
+negbin_ar1_s1_post <- rstan::extract(negbin_ar1_s1_fit)
+plt_negbin_ar1_s1 <- ribbon_plot2(negbin_ar1_s1_post$y_pred, 
+                                  as.numeric(negbin_ar1_s1_data$y),
+                                  "Negative Binomial Error Model Predictions")
+plt_negbin_ar1_s1
+plt_negbin_ar1_s1_zoom <- zoom_plot(plt_negbin_ar1_s1)
+```
+
+Zooming in on the largest spike on May 22, we see that the prediction is anomalously large because there is an unusual spike seven days previously, on May 15. This unusually high value in the observed data doesn't affect the prediction much on May 16 because the $\phi_1$ coefficient is small, however, it contributes significantly to the prediction on May 22 because of the large $\Phi_1$ coefficient. Overall, the model is best fit with a relatively large over-dispersion, but in this case, there seasonal pattern broke down in a way that combines with the large over-dispersion to produce an unrealistically large prediction.
+
+```{r, negbin_11_post_pred_detail, warning = FALSE, echo = FALSE}
+plt_negbin_ar1_s1 +
+  scale_x_date(date_breaks = "1 day", minor_breaks = NULL, limits = c(ymd("20200510"), ymd("20200601")), labels=date_format("%b %d")) +
+  ylim(0, 300) + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+These overly large predictions are not a failure of the model. It's a relatively simple model with only four parameters being used to model a complex epidemiological phenomenon. However, it would be nice to tune this model to behave a little better. The root cause is that the predictions of this model are largely a function of the value from one week ago. If the value one week ago is a little wonky, the model doesn't have any other information to moderate the effects from the strange value. We can solve this in three different ways:
+
+1. Include more seasonal and non-seasonal regressions terms.
+2. Include a moving average to smooth the overall prediction.
+3. Include covariates that bring in additional data to moderate abnormalities in any single data stream.
+
+Option 2 is a classic choice and turns the autoregressive model we have built into an autoregressive moving-average model (ARMA), which are well covered in the literature. In this post, I am going to investigate options 1 and 3.
+
+### Hyper-Parameter Choice
+
+We have been working with an $AR(1)(1)_7$ model, where the hyper-parameters $p$ and $P$ have both been set to 1. This means we have one autoregressive term and one seasonal term that is lagged by seven days. However, we can have as many seasonal and non-seasonal parameters as we want - there is nothing stopping us from using an $AR(10)(10)_7$ model other than a desire for a small model and interpretable models. Model choice is a complex and deep field, I'm just going to scratch the surface in this post.
+
+We approach this problem by running a number of different models with different values for $p$ and $P$ and then comparing the results. To choose the best model I will use approximate leave-one-out (LOO) cross-validation as provided by the `loo` package. If we have $T$ data points, LOO cross-validation fits the model $T$ times using $T-1$ data points. Each fit leaves a different data point. This lets us see the out-of-sample error of the model. However, this requires fitting the model $T$ times which for Bayesian models tends to be computationally expensive. Instead the `loo` package computes an approximate metric off a single fit of the data and includes a penalization term for the number of effective parameters. I am going to assume that the LOO metric is an accurate way of comparing models, and avoid digging through too many details. The `loo` package has many more details which can be found [here](http://mc-stan.org/loo/).
+
+First, I am going to write a few different models for different choices of $p$ and $P$. We will be comparing the following models: 
+
+* $AR(0)(2)_7$
+* $AR(0)(3)_7$
+* $AR(1)(1)_7$
+* $AR(1)(2)_7$
+* $AR(1)(3)_7$
+* $AR(2)(2)_7$
+* $AR(2)(3)_7$
+
+For brevity, I'll refer to these models in the future by `p,P`, so $AR(1)(1)_7$ will be `1,1`. We can compile the list of models:
+
+```{r, hyper_param_compile, cache = TRUE, results = 'hide', message = FALSE}
+model_names <- list()
+model_names["0,2"] = "negbin_ar0_s2.stan"
+model_names["0,3"] = "negbin_ar0_s3.stan"
+model_names["1,1"] = "negbin_ar1_s1.stan"
+model_names["1,2"] = "negbin_ar1_s2.stan"
+model_names["1,3"] = "negbin_ar1_s3.stan"
+model_names["2,2"] = "negbin_ar2_s2.stan"
+model_names["2,3"] = "negbin_ar2_s3.stan"
+
+pathes <- map(model_names, function(x) paste0(stan_path, x))
+models <- map(pathes, stan_model)
+```
+
+```{r, hyper_param_fit_funcs, echo = FALSE}
+quiet <- function(x) { 
+  sink(tempfile()) 
+  on.exit(sink()) 
+  invisible(force(x)) 
+} 
+
+run_neg_bin <- function(model, p, y) {
+  
+  negbin_data <- list(
+    "T" = length(y),
+    "y" = y,
+    
+    "betas_center" = c(-1, rep(0, p)),
+    "betas_scale" = c(1, rep(0.2, p)),
+    "inv_phi_alpha" = 5,
+    "inv_phi_beta" = 5
+  )
+  
+  fit <- quiet(sampling(model, data = negbin_data, 
+                  chains = 4, cores = 1, iter = 4000, thin = 1, warmup = 3000,
+                  seed = 12345, save_warmup = FALSE))
+  return(fit)
+}
+```
+
+And fit them for Los Angeles County.
+
+```{r, hyper_param_fit_LA}
+y_data <- county_data_daily %>%
+  filter(geoid == "06037") %>%
+  select(deaths) %>%
+  as.matrix() %>%
+  drop()
+
+negbin_fits_name <- paste0(fits_path, "negbin_fits.rds")
+
+if (file.exists(negbin_fits_name)) {
+  fits <- readRDS(negbin_fits_name)
+} else {
+  fits <- map2(models, c(2, 3, 2, 3, 4, 4, 5), function(x, y) run_neg_bin(x, y, y_data))
+  saveRDS(fits, negbin_fits_name)
+}
+```
+
+
+```{r, hyper_params_LA_summary, cache = TRUE, echo = FALSE}
+tmp <- summary(fits[["1,3"]], pars = c("inv_phi", "betas"))$summary
+```
+
+```{r, hyper_params_LA_summary_table, echo = FALSE}
+tmp %>%
+  as_tibble(rownames = NA) %>%
+  mutate(Variable = rownames(.)) %>%
+  select(Variable, everything(), -se_mean) %>%
+  mutate_if(is.numeric, format, digits = 2, nsmall = 1) %>%
+  kbl() %>%
+  kable_classic(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+Once the models have been written, compiled, and run, we can compare the performance of each model on just Los Angeles County to see if any particular model outperforms the $AR(1)(1)_7$ models we've been using. The `loo` packages calculates a measure for predictive accuracy called the expected log point-wise predictive density (ELPD) for each model. The `loo_compare` function then calculates the difference in ELPD between the best model and all other models by subtracting off the best model's ELPD. This means that the best model will have an ELPD of 0, and other models will have a negative value. Then, `loo_compare` calculates a standard error of the each ELPD from the best model's ELPD. Finally, we can divide the ELPD by the standard error to get a z-score and a probability associated with that z-score that indicate the probability of the each model being better than the best model. First we map the the `loo` function across all of the model fits:
+
+
+```{r, hyper_param_loos_LA, cache = TRUE, warning = FALSE}
+loos <- map(fits, loo)
+```
+
+And then we compare all of the models:
+
+```{r, hyper_params_compare_calc_LA}
+comp <- loo_compare(loos)
+```
+
+Below is the table of values for each model that we ran for Los Angeles County.
+
+```{r, hyper_params_compare_table_LA, echo = FALSE}
+as_tibble(comp) %>%
+  mutate(model = rownames(comp)) %>%
+  select(model, everything()) %>%
+  mutate(z_score = as.numeric(elpd_diff/se_diff)) %>%
+  replace(is.na(.), 0) %>%
+  mutate(prob = dnorm(z_score)) %>%
+  select(model, elpd_diff, se_diff, z_score, prob) %>%
+  set_colnames(c("Model", "ELPD", "ELPDSE", "z", "p")) %>%
+  mutate_if(is.numeric, format, digits = 2, nsmall = 1) %>%
+  kbl() %>%
+  kable_classic(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+Immediately we can see that the `1,1` model is the *worst* model, followed by the `0,2` model. Adding more degrees of freedom really helps with this data set. Additionally, the `1,1` models is worse than the `0,2` model by a large margin, indicating that the seasonal lags are more important than the non-seasonal lags. The best model is the `2,3` model, which has the largest number of free parameters, followed by the `1,3` model, which has better performance than the other model with 4 free parameters, the `2,2` model.
+
+While it's one thing to say that one model is better than another, we need to also determine how much better it is. This is where the other three columns come into play. While model `1,3` is has an ELPD of -1.5 compared to model `2,3`, the standard error between the two, in column ELPDSE, is about 4, meaning that the difference between the two is not all that large. This is indicated by the z-score column having a value of -0.36.
+
+The conclusions from this quick analysis are that the `1,1` model was by far the worst model we could have chosen for Los Angeles County, and that while some models are markedly better than others, `2,3` compared to `1,1`, for example, some are very close in performance, for example `2,3` and `1,3`. The next step is to perform this comparison on all counties in California that have had deaths, and see which model comes out on top.
+
+```{r, hyper_param_generate_data, echo = FALSE, results = 'hide', message = FALSE}
+generate_y <- function(geoid_in) {
+  county_data_daily %>%
+  filter(geoid == geoid_in) %>%
+  select(deaths) %>%
+  as.matrix() %>%
+  drop()
+}
+
+ca_geoids <- county_data_daily %>%
+  filter(state_fips == "06") %>%
+  group_by(geoid) %>%
+  summarize(total_deaths = sum(deaths)) %>%
+  ungroup() %>%
+  filter(total_deaths > 0) %>%
+  select(geoid) %>%
+  as.matrix()
+
+ys <- as.list(setNames(ca_geoids, ca_geoids)) %>%
+  map(generate_y)
+```
+
+```{r, hyper_param_fit_all_func, echo = FALSE}
+run_all_neg_bins <- function(y_data) {
+  fits <- map2(models, c(2, 3, 2, 3, 4, 4, 5), function(x, y) run_neg_bin(x, y, y_data))
+  loos <- map(fits, loo)
+  comp <- loo_compare(loos)
+  comp2 <- as_tibble(comp) %>%
+    mutate(model = rownames(comp)) %>%
+    select(model, everything())
+  return(comp2)
+}
+```
+
+```{r, hyper_param_fit_all, echo = FALSE, results = 'hide', warning = FALSE}
+negbin_all_fits_name <- paste0(fits_path, "negbin_all_fits.rds")
+
+if (file.exists(negbin_all_fits_name)) {
+  all_fits <- readRDS(negbin_all_fits_name)
+} else {
+  all_fits <- map(ys, run_all_neg_bins)
+  saveRDS(all_fits, negbin_all_fits_name)
+}
+```
+
+```{r, hyper_param_parse_all_fits, echo = FALSE, results = 'hide', message = FALSE}
+total_d <- county_data_daily %>%
+  group_by(geoid) %>%
+  summarise(total_deaths = sum(deaths))
+
+model_choice <- all_fits %>%
+  reduce(rbind) %>%
+  mutate(geoid = rep(names(all_fits), each = 7)) %>%
+  separate(model, into = c("ar_order", "s_order"), remove = FALSE) %>%
+  select(geoid, everything()) %>%
+  left_join(select(demographic_data, geoid, pop), by = "geoid") %>%
+  left_join(total_d, by = "geoid") %>%
+  group_by(geoid) %>%
+  #mutate(z_score = elpd_diff / se_diff,
+         #rank = factor(rank(-1*z_score, ties.method = "first"))) %>%
+  replace(is.na(.), 0) %>%
+  ungroup() %>%
+  mutate(z_score = as.numeric(elpd_diff / se_diff),
+         rank = factor(rank(-1*z_score, ties.method = "first"))) %>%
+  replace(is.na(.), 0)
+```
+
+To compare the models behavior over a large number of counties, I'll look at the mean modified z-score and associated probability as well as their standard deviations, and rank the models based on the having the highest mean probability or lowest mean modified z-score. I'm modifying the z-score by taking the log-plus-one of the absolute value of the z-score. The purpose of this transform is to reduce the importance of outliers caused by ELPDSE values close to zero, which generally indicate the model is close to the best and something strange is happening.
+
+```{r, hyper_param_compare_all, echo = FALSE, message = FALSE}
+ranked <- model_choice %>%
+  mutate(dens = dnorm(z_score)) %>%
+  group_by(model) %>%
+  summarise(`p mean` = mean(dens),
+            `p sd` = sd(dens),
+            `z mean` = mean(log(abs(z_score)+1)),
+            `z sd` = sd(log(abs(z_score)+1))) %>%
+  mutate(`p rank` = as.character(rank(desc(`p mean`))),
+         `z rank` = as.character(rank(`z mean`)))
+ranked %>%
+  arrange(`p rank`) %>%
+  mutate_if(is.numeric, format, digits = 2, nsmall = 1) %>%
+  kbl() %>%
+  kable_classic(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+Model `0,3` comes out on top, but models `0,2` and `1,2` are above model `2,2`. This indicates that model `2,2` has too many degrees of freedom in the non-seasonal component. Overall, rankings based on probability and modified z-score agree. Most importantly, the models with three seasonal parameters come out on top, then the models with two, and final model `1,1`. This highlights that the number of seasonal parameters is by far the most important factor in model performance. Within the models with three seasonal parameters, there is very little difference in performance, and we can choose which of these models makes the most sense giving our longer-term modelling goals.
+
+My intent is to build a hierarchical model where data from data-rich counties, like Los Angeles County, can help fit parameter values for data-sparse counties, like Santa Cruz County. This drastically reduces the problem of over-fitting, and more free parameters can be accommodated. For this reason, I will be moving forward with the `1,3` model, as it is nearly best in this analysis, but still includes non-seasonal autoregression.
+
+For the sake of comparison, we can look at how well the `1,3` model works on the Los Angeles County dataset. Below is the table of parameter estimates. All four of the autoregression parameters are significant, and the inverse dispersion has increased compared to the `1,1` model.
+
+```{r, hyper_param_13_LA_example_params, echo = FALSE}
+negbin_ar1_s3_summary <- summary(fits$`1,3`, pars = c("inv_phi", "betas"))$summary
+negbin_ar1_s3_summary %>%
+  as_tibble(rownames = NA) %>%
+  mutate(Variable = rownames(.)) %>%
+  select(Variable, everything(), -se_mean) %>%
+  mutate_if(is.numeric, format, digits = 2, nsmall = 1) %>%
+  kbl() %>%
+  kable_classic(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+The ribbon plot below also shows that the confidence intervals have shrunk to something more reasonable. The decrease int he confidence intervals and the increase in the inverse dispersion also indicate that the mean of our prediction is much closer to the actual values of the data, indicating that we are also making the model more accurate.
+
+```{r, hyper_param_model13_compile, echo = FALSE, results = 'hide'}
+negbin_ar1_s3_model <- models[["1,3"]]
+```
+
+```{r, hyper_param_model13_data, echo = FALSE, results = 'hide'}
+y <- county_data_daily %>%
+  filter(geoid == "06037") %>%
+  select(deaths) %>%
+  as.matrix() %>%
+  drop()
+
+negbin_ar1_s3_data <- list(
+    "T" = length(y),
+    "y" = y,
+    
+    "betas_center" = c(-1, 0, 0, 0, 0),
+    "betas_scale" = c(1, 0.2, 0.2, 0.2, 0.2),
+    "inv_phi_alpha" = 5,
+    "inv_phi_beta" = 5
+  )
+```
+
+```{r, hyper_param_model13_fit, echo = FALSE, result = 'hide'}
+negbin_ar1_s3_name <- paste0(fits_path, "negbin_ar1_s3.rds")
+
+if (file.exists(negbin_ar1_s3_name)) {
+  negbin_ar1_s3_fit <- readRDS(negbin_ar1_s3_name)
+} else {
+  negbin_ar1_s3_fit = sampling(negbin_ar1_s3_model, data = negbin_ar1_s3_data, 
+                                   chains = 4, cores = 1, iter = 4000, thin = 1, warmup = 3000,
+                                   seed = 12345, save_warmup = FALSE)
+  saveRDS(negbin_ar1_s3_fit, negbin_ar1_s3_name)
+}
+```
+
+```{r, hyper_param_model13_plots, echo = FALSE, warning = FALSE}
+negbin_ar1_s3_post <- rstan::extract(negbin_ar1_s3_fit)
+plt_negbin_ar1_s3 <- ribbon_plot2(negbin_ar1_s3_post$y_pred, 
+                                  as.numeric(negbin_ar1_s1_data$y),
+                                  "Negative Binomial Error Model Predictions")
+plt_negbin_ar1_s3
+plt_negbin_ar1_s3_zoom <- zoom_plot(plt_negbin_ar1_s3)
+```
+
+We see that by using a model that can incorporate more data we are able to shrink the confidence interval of the fit to more reasonable bounds.
+
+
+## Regression
+
+The second option we identified to improve model fit was to add covariates to the model. Thankfully, we have a convenient temporal covariate - COVID-19 case counts. While I chose not to model case counts due to their unreliability, they are still predictive of deaths and we can let the model figure out how much to rely on the case count. Adding covariates to the negative binomial model only requires adding a regression term to $\nu$. In theory, the regression variables could be any time series. In this case, I will use the 7-day and 14-day lagged values of COVID-19 case count. We use lagged case counts and not day-of case counts because we can't know day of case counts when we are trying to predict day-of death counts. Since the regression variables are counts, I will use the same log-plus-one transformation as on the autoregression variable. 
+
+If we let $w$ represent the number of cases, then the design matrix becomes
+
+$$\textbf{L} = [\vec{1}, \log(\vec{y}_{t-1}+1), \cdots, \log(\vec{y}_{t-22} + 1), \log(\vec{w}_{t-7} + 1), \log(\vec{w}_{t-14} + 1)]$$
+
+The vector of regression coefficients, $\vec{\beta}$ now has 7 components: one intercept, one non-seasonal autoregressive parameters, three seasonal autoregressive parameters, and two regression parameters.
+
+The priors for the parameters change a little once we add regression terms. The regression parameters will get the same prior as the autoregression parameters. However, the covariates, the case counts, are not centered on zero, and so any value of their regression parameters will inflate the expected value of the model. This inflation needs to be countered by the intercept, so the intercept becomes centered around a negative value. As usual, we compile the model, build the dataset, and then fit the model.
+
+```{r, compile_regression, cache = TRUE, message = FALSE, results = 'hide'}
+negbin_x_ar1_s3_path <- paste0(stan_path, "negbin_x_ar1_s3.stan")
+negbin_x_ar1_s3_model <- stan_model(negbin_x_ar1_s3_path)
+```
+
+```{r, regression_prep_data}
+y <- county_data_daily %>%
+  filter(geoid == "06037") %>%
+  select(deaths) %>%
+  as.matrix() %>%
+  drop()
+
+X <- county_data_daily %>%
+  filter(geoid == "06037") %>%
+  select(cases) %>%
+  transmute(cases_L7 = lag(cases, 7),
+            cases_L14 = lag(cases, 14)) %>%
+  replace(is.na(.), 0) %>%
+  as.matrix()
+
+negbin_x_ar1_s3_data <- list(
+  "T" = length(y),
+  "K" = dim(X)[2],
+  "y" = y,
+  
+  "X" = X,
+  
+  "betas_center" = c(-3, 0, 0, 0, 0, 0, 0),
+  "betas_scale" = c(3, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2),
+  "inv_phi_alpha" = 5,
+  "inv_phi_beta" = 5
+)
+```
+
+```{r, regression_fit, results = 'hide'}
+negbin_x_ar1_s3_name <- paste0(fits_path, "negbin_x_ar1_s3.rds")
+
+if (file.exists(negbin_x_ar1_s3_name)) {
+  negbin_x_ar1_s3_fit <- readRDS(negbin_x_ar1_s3_name)
+} else {
+  negbin_x_ar1_s3_fit = sampling(negbin_x_ar1_s3_model, data = negbin_x_ar1_s3_data, 
+               chains = 4, cores = 1, iter = 2000, thin = 1, warmup = 1000,
+               seed = 12345, save_warmup = FALSE)
+  saveRDS(negbin_x_ar1_s3_fit, negbin_x_ar1_s3_name)
+}
+```
+
+```{r, regression_summary, results = 'hide', cache = TRUE, echo = FALSE}
+negbin_x_ar1_s3_summary <- summary(negbin_x_ar1_s3_fit, pars = c("inv_phi", "betas"))$summary
+```
+
+The results of the regression are shown in the table below. The mean is smaller than its standard deviation, indicating that  there is not significant drift in the timeseries. The first three `phi` variables, which correspond to the 1-, 7-, and 14-day lags are significant, while `phi[4]`, which is the 21-day lag, is not. Most importantly, the regression on the 7-day lagged timeseries of cases is not significant, while the regression on the 14-day lagged cases is. This shows that the number of cases from two weeks ago is important in predicting the number of deaths today, which is in line with our expectations of how the COVID-19 disease progresses. Again, the negative dispersion has increased.
+
+```{r, regression_params, echo = FALSE}
+negbin_x_ar1_s3_summary %>%
+  as_tibble(rownames = NA) %>%
+  mutate(Variable = rownames(.)) %>%
+  select(Variable, everything(), -se_mean) %>%
+  mutate_if(is.numeric, format, digits = 2, nsmall = 1) %>%
+  kbl() %>%
+  kable_classic(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+The ribbon plot shows significant improvement over the `1,3` model without covariates. The confidence intervals are smaller and the mean tracks the observed data with fewer large deviations. By adding in a regression we are able to take advantage of other data sources instead of only relying on the previous values of the timeseries that we are trying to predict. 
+
+```{r, regression_post_pred, echo = FALSE, warning = FALSE}
+negbin_x_ar1_s3_post <- rstan::extract(negbin_x_ar1_s3_fit)
+plt_negbin_x_ar1_s3 <- ribbon_plot2(negbin_x_ar1_s3_post$y_pred, 
+                                    as.numeric(negbin_x_ar1_s3_data$y),
+                                    "Negative binomial model with regression")
+plt_negbin_x_ar1_s3
+plt_negbin_x_ar1_s3_zoom <- zoom_plot(plt_negbin_x_ar1_s3)
+```
+
+## Building a Hierarchical Model
+
+### Introduction
+
+The idea that bringing in more data improves the performance of the model brings us to the final section of this post. I'd like to bring in one more sources of data: using death counts in one county to predict deaths counts in another.
+
+Regressing the deaths in one county on the deaths in another can be accomplished in a few ways. First, we could regress every county on every other county's lagged counts. This is called vector autoregression because at any time $t$, we have a vector $\vec{y}_t$ of $N$ counts, where $N$ is the number of counties, and we perform autoregression on the vector $\vec{y}_t$. Vector autoregression introduces $N^2$ new parameters, which are hard to interpret and may not be of interest. An alternative is to set a condition on which counties can interact. This is called conditional autoregression. A common condition is that only neighboring counties can influence each other. If the average number of neighbors is $c$, then this adds $cN$ new regression parameters. But, quite frankly, I think we have enough parameters as is. The more parameters, the more challenging interpreting those parameters is. Instead of vector or conditional autoregression, we can build a hierarchical model that only adds a small number of parameters.
+
+Hierarchical models work under the assumption that if we are performing many similar regressions, the coefficients for those regressions are probably related. 
+
+Hierarchical model start to have many parameters across many dimensions, and before we dive into examples we need to continue developing a coherent notation. Previously we had a column vector $\vec{y}$ of observations of of deaths within a county over time. We indexed into $\vec{y}$ with a time index $t$, to get a single count of deaths at a specific time, $y_t$. We are going to add an additional index, $n$ to account for different counties, so that $y_{t, n}$ is a single count of deaths in county $n$ at time $t$. Similarly for the design matrix and parameter vector, $L_{t,k,n}$ is the $k$th covariate at time $t$ for county $n$, and $\beta_{k,n}$ is the $k$th parameter for county $n$.If we're talking about a certain county, then I'll label that county's parameters just as $\beta_k$.
+
+I'll also introduce the $*$ notation to indicate "all of the variable along this dimension." For example $\beta_{*,n}$ is all of the parameters for county $n$, and $\beta_{k,*}$ is the $k$th parameter for all of the counties.
+
+Going back to our `1,3` model with covariates, we have seven parameters per county encoded in $\beta$. Focusing on $\beta_{1,*}$, the intercept, we would expect all $N$ of the parameters in $\beta_{1,*}$ to be similar. This is powerful because it allows a county with a well defined intercept, like Los Angeles County, to "lend" information to counties like Santa Cruz County, where there is too little data to define the intercept well. Sharing data across counties is reasonable in this case because we would expect the underlying mechanisms creating this data - notably the COVID-19 pandemic as well as reporting abnormalities - to be similar across counties, even if it can't be detected due to so few deaths.
+
+For example, Los Angeles County has a large amount of data, and estimates $\beta_3$ to be $0.27 \pm 0.05$. This will strongly influence $\mu_3$ towards about 0.2. On the other hand, Santa Cruz County, which has very little information in its timeseries will default towards 0.2 instead of 0, which makes more sense. 
+
+### Theory
+
+Mathematically, we create a hierarchical model by changing the priors we set for each parameter. Previously, we set an independent prior for each county's $\beta_{k,*}$:
+
+$$\beta_{k,*} \sim \text{Normal}(0, 0.2)$$
+If we change the center and spread of the prior to be parameters estimated by the model, then the model can choose what center and spread best fit $\beta_{k,*}$ for all counties. These hierarchical parameters can be correlated between counties, which is not something we've dealt with before. Correlation is accounted for by using a covariance matrix in a multi-normal distribution for $\beta$. We'll look more at where exactly these correlations come from and what they mean with some illustrative examples after we fit the model.
+
+Then, for all $n$:
+
+$$\beta_{*, n} \sim \text{MVNormal}(\mu_{\beta}, \Sigma_{\beta})$$
+
+First well focus on the mean hierarchical parameter, $\mu_\beta$, which is a length $K$ vector. The prior for $\mu_\beta$ is 
+
+$$\mu_{\beta} \sim \text{Normal}(\mu_{\beta, center}, \mu_{\beta, scale})$$
+Where $\mu_{\beta, center}$ and $\mu_{\beta, scale}$ are defined by the user and fed into the model.
+
+Next is $\Sigma_\beta$, which is a $K \times K$ covariance matrix. We can decompose the covariance matrix into diagonal matrices, $\text{diag}(\tau_\beta)$, that have the scale of each parameter on the diagonal and a correlation matrix, $\Omega_\beta$. In order to mimic the notation within Stan, the diagonal scale matrix is represented as $\text{diag}(\tau_\beta)$, where the $\text{diag}$ function takes the scale vector $\tau_\beta$ and places it on the diagonal of a matrix. Then we only have to specify the vector $\tau_\beta$.
+
+$$\Sigma_\beta = \text{diag}(\tau_\beta) \enspace \Omega_\beta \enspace \text{diag}(\tau_\beta)$$
+
+The scale hierarchical parameter $\tau_\beta$ is specified in the same way as the mean hierarchical parameter:
+
+$$\tau_\beta \sim \text{Normal}^+(\tau_{\beta,center}, \tau_{\beta,scale})$$
+Where $\tau_{\beta, center}$ and $\tau_{\beta, scale}$ are user defined.
+
+The correlation matrix gets a LKJ prior, with an LKJ scale parameter $\eta$. $\eta = 1$ places equal weights on the diagonal as the off-diagonal elements indicating some cross correlation, $\eta < 1$ places more weight on the off-diagonal indicating significant cross correlation, and $\eta>1$ places more weight on the diagonal indicating less cross-correlation. For our data, I expect there to be some correlation, but large correlations can indicate systematic identifiability problems, which we haven't run into. With this belief, I'll set a normal prior with a small standard deviation on the inverse of $\eta$ to push $eta$ to larger values and less cross-correlation.
+
+$$\Omega_\beta \sim \text{LKJCorr}(\eta)$$
+
+$$\frac{1}{\eta} \sim \text{Normal}^+(0, .3)$$
+
+Why is hierarchical modelling important? First, it creates a more coherent model. If we believe that the underlying phenomenon is roughly the same in all counties, then that belief should be encoded in the model. Second, it regularizes parameter estimation for timeseries that have very little information. This is important because it reduces outliers that may confuse interpretation of model results as well as cause strange and unreliable behavior in prediction. Finally, it allows the priors for the first-order parameters to be set by the model, creating more accurate overall parameter estimates.
+
+### Model Results
+
+We implement the above mathematical changes in our stan program, as well as a non-centered parameterization for the hierarchical parameters in order to avoid Neal's funnel and allow the HMC sampler to nimbly navigate our model's phase space. The non-centered parameterization and Neal's funnel are well discussed in just about every resource on Bayesian hierarchical models. 
+
+```{r, compile_hier, cache = TRUE, results = 'hide', message = FALSE, results = 'hide'}
+negbin_x_ar1_s3_hier_path <- paste0(stan_path, "negbin_x_ar1_s3_hL_corr.stan")
+negbin_x_ar1_s3_hier_model <- stan_model(negbin_x_ar1_s3_hier_path)
+```
+
+```{r, hier_county_select, echo = FALSE}
+target_geoids <- county_data_daily %>%
+  filter(state_fips == "06") %>%
+  select(geoid) %>%
+  unique() %>%
+  pull(geoid)
+
+pops <- demographic_data %>%  
+  filter(geoid %in% target_geoids)
+```
+
+This hierarchical model eats data for breakfast. We need to keep the data organized so that the regression parameters stay matched to the right counties and variables. We will feed two matrices into the models as data, a response matrix and a regression matrix. If we have $T$ time steps and $N$ counties, then the response matrix $y$ will be an $N \times T$ matrix. If the regression matrix has $K$ parameters, then the regression matrix $X$ will be a $N \times T \times K$ matrix. The model will take care of constructing the $\textbf{L}$ matrix from $y$ and $X$.
+
+```{r, hier_counter, echo = FALSE, results = 'hide', message = FALSE}
+counters <- county_data_daily %>%
+  filter(geoid %in% target_geoids) %>%
+  group_by(geoid) %>%
+  summarize(total_deaths = sum(deaths), total_cases = sum(cases)) %>%
+  mutate(num = seq(1, length(total_deaths), 1),
+         ratio = total_deaths / total_cases)
+```
+
+We can construct the $y$ matrix:
+
+```{r, hier_y}
+y <- county_data_daily %>%
+  filter(geoid %in% target_geoids) %>%
+  select(geoid, date, deaths) %>%
+  pivot_wider(names_from = geoid, values_from = deaths) %>%
+  select(-date) %>%
+  as.matrix() %>%
+  t()
+```
+
+And then the $X$ matrix. Since lagging values creates `NaN` values where there isn't data, we have to manually set those `NaN` values back to zero. This is a safe assumption, as the timeseries starts when the first cases are discovered, therefore, the `NaN` values are, by definition, zero.
+
+```{r, hier_X}
+X = county_data_daily %>%
+  filter(geoid %in% target_geoids) %>%
+  select(geoid, date, cases) %>%
+  pivot_wider(names_from = geoid, values_from = cases) %>%
+  select(-date) %>%
+  as.matrix()
+
+X <- abind(t(lag(X, 7)),
+           t(lag(X, 14)), along = 3)
+
+X[is.na(X)] <- 0
+```
+
+Finally, we can combine all of the data and run the model.
+
+```{r, hier_data}
+negbin_x_ar1_s3_hier_data <- list(
+  "N" = dim(y)[1],
+  "T" = dim(y)[2],
+  "K" = dim(X)[3],
+  "y" = y,
+  
+  "X" = X,
+  
+  "mu_betas_center" = c(-2, 0, 0, 0, 0, 0, 0),
+  "mu_betas_scale" = c(2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2),
+  "tau_betas_center" = c(0, 0, 0, 0, 0, 0, 0),
+  "tau_betas_scale" = c(2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2),
+  "inv_phi_alpha" = 5,
+  "inv_phi_beta" = 5
+)
+```
+
+
+```{r, hier_fit, results = 'hide'}
+negbin_x_ar1_s3_hier_name <- paste0(fits_path, "negbin_x_ar1_s3_hier.rds")
+
+if (file.exists(negbin_x_ar1_s3_hier_name)) {
+  negbin_x_ar1_s3_hier_fit <- readRDS(negbin_x_ar1_s3_hier_name)
+} else {
+  negbin_x_ar1_s3_hier_fit = sampling(negbin_x_ar1_s3_hier_model, data = negbin_x_ar1_s3_hier_data, 
+               chains = 4, cores = 4, iter = 2000, thin = 1, warmup = 1000,
+               seed = 12345, save_warmup = FALSE)
+  saveRDS(negbin_x_ar1_s3_hier_fit, negbin_x_ar1_s3_hier_name)
+}
+```
+
+This time around Stan returns a few warnings. 
+
+As always, we check to make sure that the diagnostics of the fit look good. Properly specified hierarchical models can be more stable than running many regression on the individual data sets like we did when choosing hyper-parameters due to the sharing of information and regularization that happens in a hierarchical model. We see that there are no glaring causes for concern:
+
+```{r, hier_diagnostic}
+check_hmc_diagnostics(negbin_x_ar1_s3_hier_fit)
+```
+
+```{r, hier_summary, results = 'hide', echo = FALSE, cache = TRUE}
+negbin_x_ar1_s3_hier_summary <- summary(negbin_x_ar1_s3_hier_fit, pars = c("inv_phi", "betas"))$summary
+negbin_x_ar1_s3_hier_summary_hier <- summary(negbin_x_ar1_s3_hier_fit, pars = c("eta", "mu_betas", "tau_betas"))$summary
+```
+
+```{r, hier_post, echo = FALSE, cache = TRUE, results = 'hide'}
+negbin_x_ar1_s3_hier_post <- rstan::extract(negbin_x_ar1_s3_hier_fit)
+```
+
+```{r, hier_pairs, eval = FALSE, echo = FALSE}
+np = nuts_params(negbin_x_ar1_s3_hier_fit)
+mcmc_pairs(negbin_x_ar1_s3_hier_fit, pars = c("mu_betas[1]", "mu_betas[2]", "tau_betas[1]", "tau_betas[2]"), np = np)
+mcmc_pairs(negbin_x_ar1_s3_hier_fit, pars = c("mu_betas[3]", "mu_betas[4]", "tau_betas[3]", "tau_betas[4]"), np = np)
+mcmc_pairs(negbin_x_ar1_s3_hier_fit, pars = c("mu_betas[5]", "mu_betas[6]", "tau_betas[5]", "tau_betas[6]"), np = np)
+mcmc_pairs(negbin_x_ar1_s3_hier_fit, pars = c("mu_betas[5]", "mu_betas[7]", "tau_betas[5]", "tau_betas[7]"), np = np)
+mcmc_pairs(negbin_x_ar1_s3_hier_fit, parc = c("Omega_betas[1,2]", "Omega_betas[1,3]", "Omega_betas[1,4]", 
+                                              "Omega_betas[1,5]", "Omega_betas[1,6]", "Omega_betas[1,7]"), np = np)
+```
+
+Hierarchical models suffer from parameter explosion, and looking at tables of hundred of parameters is not generally useful. We'll start by looking at the table of hierarchical parameters and then move on to plotting parameter values.
+
+The following table shows all of the hierarchical parameters. The first variable, $\eta$(`eta`) is the control parameter for the correlation matrix between hierarchical parameters. A value above one indicates that there is not so much correlation. Then we move on to the mean $\mu_\beta$(`mu_betas`) and the scale $\tau_\beta$(`tau_betas`) parameters. These are the mean and standard deviation for all of the county-level parameters in California, and can give us a high-level idea of what the important parameters are.
+
+1. Intercept (`mu_betas[1]` and `tau_betas[1]`): The mean parameter is very far from zero and, as discussed before, balances out the extra positive values added by the regression. The scale parameter is relatively large indicating that there is a decent amount of variation among the counties. This is reasonable, as from previous work it looked like large counties with large cases counts have a more steady relationship between cases and deaths. Small counties tend to have few cases and usually a lower overall mortality rate, driving the intercept to lower values.
+
+2. Non-seasonal AR, lag-1 (`mu_betas[2]` and `tau_betas[2]`): The non-seasonal autoregression parameter is not significantly different than zero on average. However, the scale parameter is much larger than the mean, indicating that this parameter is very positive for some counties and very negative for others. It is interesting that this parameter can be either positive or negative, depending on county. We'll look into this more later. 
+
+3. Seasonal AR, lag-7 (`mu_betas[3]` and `tau_betas[3]`): The seasonal autoregression parameters are significant, positive, and the scale parameters are smaller than the means, indicating that almost all counties have positive seasonal parameters, it's just a question as to how strong of an association there is. This is exactly what I would expect.
+
+4. Seasonal AR, lag-14 (`mu_betas[4]` and `tau_betas[4]`): See above.
+
+5. Seasonal AR, lag-21 (`mu_betas[5]` and `tau_betas[5]`): See above^2.
+
+6. Regression Cases, lag 7 (`mu_betas[6]` and `tau_betas[6]`): The regression on cases has the same pattern as the seasonal autoregressive parameters. The mean is significant, positive, and the scale is smaller than the mean, meaning most of the mass is above zero. 
+
+7. Regression Cases, lag 14 (`mu_betas[7]` and `tau_betas[7]`): See above.
+
+
+```{r, hier_param_estimates2, echo = FALSE}
+negbin_x_ar1_s3_hier_summary_hier %>%
+  as_tibble(rownames = NA) %>%
+  mutate(Variable = rownames(.)) %>%
+  select(Variable, everything(), -se_mean) %>%
+  mutate_if(is.numeric, format, digits = 2, nsmall = 1) %>%
+  kbl() %>%
+  kable_classic(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+The idea that the nonseasonal autoregressive parameter could have a negative value is strange. We can look at a plot of the non-seasonal AR parameter value by average deaths per day by county to see what's going on.
+
+```{r, hier_ar1_negative_plot, echo = FALSE, warning = FALSE, width = 8}
+counters %>%
+  mutate(pop = pops$pop,
+         log_pop = pops$log_pop,
+         b2_mean = apply(negbin_x_ar1_s3_hier_post$betas, c(2,3), mean)[,2],
+         b2_sd = apply(negbin_x_ar1_s3_hier_post$betas, c(2,3), sd)[,2],
+         deaths_per_day = total_deaths / dim(y)[2]) %>%
+  ggplot(aes(x = deaths_per_day, y = b2_mean)) +
+  geom_hline(aes(yintercept = 0), color = "darkred", alpha = 0.5) +
+  geom_errorbar(aes(ymin = b2_mean - b2_sd, ymax = b2_mean + b2_sd), alpha = 0.3) +
+  geom_point(size = 2) + 
+  scale_x_log10() +
+  labs(x = "Log average deaths per day",
+       y = "Non-seasonal AR parameter",
+       title = "Non-seasonal parameter values by CA county") +
+  theme_bw()
+```
+
+For counties with low average deaths per day, the parameter value is negative, but once the average deaths per day climbs above 2 or 3, the parameter value goes positive. Additionally, the credible interval for counties with lower deaths per day is larger, indicating that the model isn't too confident in those values - many credible intervals overlap with zero. Whats going on is that when there are fewer than one or so deaths per day (because some days can have multiple deaths) a day with a death is typically followed by a day with zero deaths. Until nearly every day has a death or more, it just isn't that likely that there are two days in a row with a death. To some extent this is an artifact of the count data that we are using. Because there is either 0 or 1 death the model doesn't get a whole lot of feedback on what value the parameter should take, hence the large credible interval and negative results for low average deaths per day counties. 
+
+With an explanation for the negative average non-seasonal AR parameter we can move on to the $\phi^{-1}$/`inv_phi` parameter, recreating the plot from above, but with $\phi^{-1}$ instead of the non-seasonal AR parameter:
+
+```{r, hier_dispersion_plot, echo = FALSE, warning = FALSE, width = 8}
+counters2 <- counters %>%
+  mutate(pop = pops$pop,
+         log_pop = pops$log_pop,
+         b2_mean = apply(negbin_x_ar1_s3_hier_post$inv_phi, c(2), mean),
+         b2_sd = apply(negbin_x_ar1_s3_hier_post$inv_phi, c(2), sd),
+         deaths_per_day = total_deaths / dim(y)[2]) 
+
+ggplot(counters2, aes(x = deaths_per_day, y = b2_mean)) +
+  geom_errorbar(aes(ymin = b2_mean - b2_sd, ymax = b2_mean + b2_sd), alpha = 0.3) +
+  geom_point(size = 2) + 
+  scale_x_log10() +
+  labs(x = "Log average deaths per day",
+       y = "Negative binomial dispersion",
+       title = "Inverse dispersion by CA county") +
+  theme_bw()
+```
+
+The dispersion is proportional to $\phi^{-1}$ not $\phi$, so the above plot shows that the dispersion is the highest when there are a moderate number of deaths per day. Breaking this down, when there are very few deaths per day the model really has nothing to work with, and the estimate of the dispersion is 1, which is just what the prior is. When there are very many deaths the dispersion parameter multiplies the **square** of the center of the negative binomial. However, when there are many deaths, the center of the negative binomial is large and squaring it makes it much much larger. This encourages the dispersion parameter to shrink. However, in the middle, the center of the negative binomial isn't very large, and the model might not have quite enough data to work with, making for a mediocre model. This is the zone where the dispersion parameter needs to be high.
+
+### Correlations
+
+So previously when discussing the need to change the prior for the intercept when we added regression terms we discussed how the intercept needs to have a lower value in order to account for the added value that the regression can bring. In theory, if a county has disproportionately many cases compared to deaths, the intercept will need to be lower to balance out the  high number of cases. We can look if there is a pattern here by plotting the estimated intercept for every county against the estimated value of the cases regression parameter.
+
+```{r, corr_2param_example_data, echo = FALSE}
+betas_means <- apply(negbin_x_ar1_s3_hier_post$betas, c(2,3), mean) %>%
+  as_tibble() %>%
+  rename_with(function(x) str_replace(x, "V", "m"))
+betas_sds <- apply(negbin_x_ar1_s3_hier_post$betas, c(2,3), sd) %>%
+  as_tibble() %>%
+  rename_with(function(x) str_replace(x, "V", "s"))
+
+betas_df <- bind_cols(counters2, betas_means, betas_sds)
+```
+
+```{r, corr_2param_example_plot, echo = FALSE, warning = FALSE, width = 8}
+my_breaks <- c(.01, .03, .1, .3, 1, 3, 10)
+
+as_tibble(betas_df) %>%
+  rename_with(function(x) str_replace(x, "V", "m")) %>%
+  ggplot(aes(x = m1, y = m6, color = deaths_per_day)) +
+  geom_errorbar(aes(ymin = m6 - s6, ymax = m6 + s6), alpha = 0.2) +
+  geom_errorbarh(aes(xmin = m1 - s1, xmax = m1 + s1), alpha = 0.2) +
+  geom_point(size = 2) +
+  scale_color_gradient(low = "darkred", high = "yellow",
+                       name = "Deaths per day", trans = "log",
+                       breaks = my_breaks, labels = my_breaks) +
+  theme_bw() +
+  labs(x = "Intercept",
+       y = "7-day lagged cases regression",
+       title = "Correlation between parameters")
+```
+
+We see that these parameters are strongly correlated! This is the correlation that is included in the estimation of the variance of the hierarchical parameters, and is encoded as a correlation matrix in the model as $\Omega_\beta$/`Omega_betas`. This correlation matrix encodes the structure of how different parameters are important for different counties. Additionally, the coloring above highlights how the average number of deaths per day describes well which parameters are more important for a given county. We can look at the full correlation matrix to see what other patterns are present in the data.
+
+```{r, corr_plot, echo = FALSE, warning = FALSE}
+Omega_means <- apply(negbin_x_ar1_s3_hier_post$Omega_betas, c(2,3), mean)
+Omega_sds <- apply(negbin_x_ar1_s3_hier_post$Omega_betas, c(2,3), sd)
+Omega_z <- Omega_means / Omega_sds
+diag(Omega_z) <- 0
+
+var_names <- c(`Intercept` = "1", 
+               `AR 1` = "2",
+               `Seasonal AR 1` = "3",
+               `Seasonal AR 2` = "4",
+               `Seasonal AR 3` = "5",
+               `Regression 1` = "6",
+               `Regression 2` = "7")
+
+Omega_means_df <- as_tibble(Omega_means) %>%
+  mutate(a1 = 1:7) %>%
+  pivot_longer(starts_with("V"), names_to = "a2", values_to = "z_score") %>%
+  mutate(a2 = as.integer(str_sub(a2, start=2))) %>% 
+  filter(a2 < a1) %>%
+  mutate(a1 = fct_recode(as.factor(a1), !!!var_names),
+         a2 = fct_recode(as.factor(a2), !!!var_names))
+
+ggplot(Omega_means_df, aes(x = a1, y  = a2, fill = z_score)) +
+  geom_tile() +
+  scale_fill_distiller(palette = "RdBu", limits = c(-1,1)*max(abs(Omega_means_df$z_score))) +
+  coord_equal() +
+  scale_y_discrete(position = "right") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 30, vjust = 1, hjust = 1)) +
+  theme(
+  axis.title.x = element_blank(),
+  axis.title.y = element_blank(),
+  panel.grid.major = element_blank(),
+  panel.border = element_blank(),
+  panel.background = element_blank(),
+  axis.ticks = element_blank(),
+  legend.justification = c(1, 0),
+  legend.position = c(0.45, 0.7),
+  legend.direction = "horizontal")+
+  guides(fill = guide_colorbar(barwidth = 7, barheight = 1,
+                title.position = "top", title.hjust = 0.5)) +
+  labs(title = "Hierarchical parameter correlation matrix",
+       fill = "Correlation")
+```
+
+The correlation matrix identifies a few additional correlations. Unsurprisingly, the intercept also has a negative correlation with the 14-day lagged cases regression parameter. The three seasonal AR parameters are positively correlated with each other, but negatively correlated with the non-seasonal parameter and the intercept. This indicates that counties that have a more deaths may have enough of a trend for the seasonal coefficient to be the best predictors, while counties with fewer deaths fall into a different regime where more naive prediction with just the non-seasonal AR coefficient might be better. 
+
+
+## Conclusions
+
+With all of the models run, I'll step back for a high-level overview of what I've accomplished. I set out to build a timeseries model for COVID-19 deaths in US counties. I started simple with an industry standard model, and upon discovering the limitation of that model, moved to subsequently more complex models tailored to the specific application. The result is a robust and powerful model that uses a limited set of data to explain the variation in COVID-19 deaths within a county.
+
+I started off with a seasonal autoregressive model with a normal error model. This is a standard model that can be found in any statistical or timeseries analysis package. The normal error model didn't work with our count data - the credible interval extended into the negatives, which is clearly not possible. The normal model also assume heteroskedastic errors, which is not the case, and had far too large of a credible interval early in the timeseries, when there were consistently zero deaths.
+
+The next model swapped the normal error model for a Poisson error model to better fit our positive, integer data. This prevented the credible interval from going into negative number, fixing one problem, but over corrected for the second problem, giving far too small of a credible interval. In fact, the Poisson model didn't predict zero deaths at any point for the Los Angeles county dataset, which only had regular casualties starting a month into the dataset!
+
+The problem with the Poisson error model is a common one - the single parameter of the Poisson model doesn't allow for large variances. This was fixed in my third model by changing the Poisson error model to a negative binomial error model. The negative binomial model keeps all the credible intervals above zero while also letting the variance be as large as it needs to in order to fit the data. This was a big achievement, but finally fixing the form of the error model highlighted another glaring issue, the two-term seasonal autoregressive model I had been working with wasn't actually a good choice for the data.
+
+After performing approximate leave-one-out cross-validation with different hyper-parameter choices, I built a fourth model that included two additional seasonal regression terms. This model fit data for larger counties well, but while performing the cross-validation I noticed that smaller counties with smaller numbers of deaths were challenging to fit and very sensitive to priors.
+
+The fifth model adds in covariates to bring more data into the model. These covariates helped stabilize the
+
+The final model addresses the challenge posed by these smaller counties by hierarchically structuring the regression to allow counties with informative timeseries to "lend" data to smaller counties. This final, hierarchical model is robust to timeseries with little information, and is a powerful tool to apply the timeseries model across many counties. 
+
+The final model uses the state-level organization of counties and a small number of covariates to explain as much variation as possible in the timeseries. By being true to the timeseries nature of the data, this model sets the stage for the next part of this project where I will assess the importance of spatial patterns and demographic variables on mortality rates due to COVID-19.
+
+This final plot shows the progression of model results, highlighting the failures of each model until we arrive at the final result. Each row is one of the six models listed above, in order. The left column is fits for Los Angeles County, population 10 million, the right column is fits for Santa Cruz County, population 270 thousand.
+
+
+```{r, hier_post_pred_LA, cache = TRUE, echo = FALSE}
+i = 19
+plt_negbin_x_ar1_s3_hier <- ribbon_plot2(negbin_x_ar1_s3_hier_post$y_pred[, i, ], 
+                                         as.numeric(negbin_x_ar1_s3_hier_data$y[i, ]),
+                                         TeX('Hierarchical Negative Binomial $AR(1)(3)_7$ with Covariates'))
+plt_negbin_x_ar1_s3_hier_zoom <- zoom_plot(plt_negbin_x_ar1_s3_hier)
+```
+
+```{r, hier_post_pred_SC, cache = TRUE, echo = FALSE}
+i = 44
+plt_negbin_x_ar1_s3_hier_sc <- ribbon_plot2(negbin_x_ar1_s3_hier_post$y_pred[, i, ], 
+                                            as.numeric(negbin_x_ar1_s3_hier_data$y[i, ]),
+                                            TeX('Hierarchical Negative Binomial $AR(1)(3)_7$ with Covariates'))
+plt_negbin_x_ar1_s3_hier_zoom_sc <- zoom_plot(plt_negbin_x_ar1_s3_hier_sc)
+```
+
+```{r, rerun_func, echo = FALSE}
+rerun_model_plot <- function(model, prev_data, county_geoid, title, reg = FALSE) {
+  y <- county_data_daily %>%
+    filter(geoid == county_geoid) %>%
+    select(deaths) %>%
+    as.matrix() %>%
+    drop()
+  
+  X <- county_data_daily %>%
+    filter(geoid == county_geoid) %>%
+    select(cases) %>%
+    transmute(cases_L1 = lag(cases, 7),
+              cases_L7 = lag(cases, 14)) %>%
+    replace(is.na(.), 0) %>%
+    as.matrix()
+  
+  new_data <- prev_data
+  new_data$y <- y
+  
+  if (reg) {
+    new_data$X <- X
+  }
+  
+  fit <- quiet(sampling(model, data = new_data, 
+                 chains = 4, cores = 1, iter = 2000, thin = 1, warmup = 1000,
+                 seed = 12345, save_warmup = FALSE))
+  
+  post <- rstan::extract(fit)
+  plot <- ribbon_plot2(post$y_pred, 
+                      as.numeric(new_data$y),
+                      title)
+  return(plot)
+}
+```
+
+
+```{r, comp_rerun_models_plots, cache = TRUE, echo = FALSE}
+plt_normal_ar1_s1 <- rerun_model_plot(normal_ar1_s1_model, normal_ar1_s1_data, "06037", TeX('Los Angeles: Normal $AR(1)(1)_7$'))
+plt_poisson_ar1_s1 <- rerun_model_plot(poisson_ar1_s1_model, poisson_ar1_s1_data, "06037", TeX('Los Angeles: Poisson $AR(1)(1)_7$'))
+plt_negbin_ar1_s1 <- rerun_model_plot(negbin_ar1_s1_model, negbin_ar1_s1_data, "06037", TeX('Los Angeles: Negative Binomial $AR(1)(1)_7$'))
+plt_negbin_ar1_s3 <- rerun_model_plot(negbin_ar1_s3_model, negbin_ar1_s3_data, "06037", TeX('Los Angeles: Negative Binomial $AR(1)(3)_7$'))
+plt_negbin_x_ar1_s3 <- rerun_model_plot(negbin_x_ar1_s3_model, negbin_x_ar1_s3_data, "06037", TeX('Los Angeles: Negative Binomial $AR(1)(3)_7$ with Covariates'), reg = TRUE)
+plt_normal_ar1_s1_sc <- rerun_model_plot(normal_ar1_s1_model, normal_ar1_s1_data, "06087", TeX('Santa Cruz: Normal $AR(1)(1)_7$'))
+plt_poisson_ar1_s1_sc <- rerun_model_plot(poisson_ar1_s1_model, poisson_ar1_s1_data, "06087", TeX('Santa Cruz: Poisson $AR(1)(1)_7$'))
+plt_negbin_ar1_s1_sc <- rerun_model_plot(negbin_ar1_s1_model, negbin_ar1_s1_data, "06087", TeX('Santa Cruz: Negative Binomial $AR(1)(1)_7$'))
+plt_negbin_ar1_s3_sc <- rerun_model_plot(negbin_ar1_s3_model, negbin_ar1_s3_data, "06087", TeX('Santa Cruz: Negative Binomial $AR(1)(3)_7$'))
+plt_negbin_x_ar1_s3_sc <- rerun_model_plot(negbin_x_ar1_s3_model, negbin_x_ar1_s3_data, "06087", TeX('Santa Cruz: Negative Binomial $AR(1)(3)_7$ with Covariates'), reg = TRUE)
+```
+
+```{r, comp_extract_legend, echo = FALSE, results = 'hide'}
+#extract legend
+#https://github.com/hadley/ggplot2/wiki/Share-a-legend-between-two-ggplot2-graphs
+g_legend <- function(a.gplot) {
+  tmp <- ggplot_gtable(ggplot_build(a.gplot))
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  return(legend)
+}
+```
+
+```{r, comp_plots, cache = TRUE, echo = FALSE, fig.width = 18, fig.height = 17.5}
+mylegend <- g_legend(plt_normal_ar1_s1 + theme(legend.position="bottom"))
+
+p3 <- grid.arrange(arrangeGrob(
+    plt_normal_ar1_s1 + 
+      theme(legend.position="none") +
+      labs(caption = "Problem: Credible interval is negative and too large."), 
+    plt_normal_ar1_s1_sc + 
+      theme(legend.position="none") +
+      labs(caption = "Problem: Credible interval is negative."), 
+    
+    plt_poisson_ar1_s1 + 
+      theme(legend.position="none") +
+      labs(caption = "Problem: Credible interval is far too small."), 
+    plt_poisson_ar1_s1_sc + 
+      theme(legend.position="none") + 
+      labs(caption = "Acceptable"),
+    
+    plt_negbin_ar1_s1 + 
+      theme(legend.position="none") +
+      labs(caption = "Problem: Model is spiky and noisy."), 
+    plt_negbin_ar1_s1_sc + 
+      theme(legend.position="none") +
+      labs(caption = "Problem: Credible interval is too large."), 
+    
+    plt_negbin_ar1_s3 + 
+      theme(legend.position="none") +
+      labs(caption = "Problem: Model still shows spiky behavior."), 
+    plt_negbin_ar1_s3_sc + 
+      theme(legend.position="none") + 
+      labs(caption = "Problem: Model is nearly constant."), 
+    
+    plt_negbin_x_ar1_s3 + 
+      theme(legend.position="none") + 
+      labs(caption = "Acceptable"), 
+    plt_negbin_x_ar1_s3_sc + 
+      theme(legend.position="none") + 
+      labs(caption = "Problem: Uninformative data still sensitive to priors."),
+    ncol = 2),
+  mylegend, nrow = 2, heights = c(15, 1))
+```
+
+And finally, the hierarchical negative binomial models solves all of the problems listed, resulting in robust parameter estimation across many counties with different patterns and quality of data.
+
+```{r, comp_plots_hier, cache = TRUE, echo = FALSE, fig.width = 18, fig.height = 5}
+p4 <- grid.arrange(arrangeGrob(
+    plt_negbin_x_ar1_s3_hier + theme(legend.position="none"),
+    plt_negbin_x_ar1_s3_hier_sc + theme(legend.position="none"),
+    ncol = 2),
+  mylegend, nrow = 2, heights = c(3, 1))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

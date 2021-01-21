@@ -1,0 +1,420 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+## Introduction
+
+We dealt with temporal autocorrelation, now we need to look at spatial autocorrelationn.
+
+### Libraries
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(ggpubr)
+library(see)
+
+library(rstan)
+library(bayesplot)
+library(rstantools)
+library(INLA)
+library(igraph)
+
+library(sf)
+library(spdep)
+library(spatialreg)
+library(tmap)
+library(tmaptools)
+
+work_dir <- Sys.getenv("r_covid_workdir")
+stan_path <- paste0(work_dir, "/stan_models/")
+
+source(paste0(work_dir,"/scripts/covid_utilities.R"))
+```
+
+
+## The Data
+
+We are just going to look at a single snap-shot in time and try to understand the spatial patterns present. Later we will combine this spatial model with the previously developed temporal model to create a more holistic model.
+
+### Import
+
+```{r}
+county_geoms_fname <- paste(work_dir, "/data/processed/county_geometry.geojson", sep="")
+county_geoms <- st_read(dsn = county_geoms_fname) %>%
+  arrange(geoid)
+
+county_data_weekly_fname <- paste(work_dir, "/data/processed/county_data_weekly.csv", sep="")
+county_data_weekly <- read_csv(county_data_weekly_fname) %>%
+  arrange(geoid)
+```
+
+### Spatial Weight Matrix
+
+From the data we can select the week that we want to look at in more depth and then calculate the spatial weights matrix.
+
+```{r}
+target_week <- 30
+az_ca_nv = c("04", "06", "32")
+west = c("04", "06", "08", "16", "30", "32", "35", "41", "49", "53", "56")
+states <- c("06")
+
+ca_data <- county_data_weekly %>%
+  filter(state_fips %in% states) %>%
+  filter(week == target_week) %>%
+  mutate(rate = deaths_w / pop * 100000)
+ca_geoms <- county_geoms %>%
+  filter(state_fips %in% states)
+
+coords <- st_centroid(st_geometry(ca_geoms), of_largest_polygon=TRUE)
+wQ = queen_knn_connect(ca_geoms)
+wQ <- make.sym.nb(wQ)
+neighbor_list <- nb2listw(wQ, style = "B")
+```
+
+
+## BYM
+
+
+
+```{r}
+# https://www2.census.gov/programs-surveys/demo/about/housing-patterns/multigroup_entropy.pdf
+entropy_score <- function(df, col_names) {
+  df %>%
+  select(all_of(col_names)) %>%
+  mutate(across(all_of(col_names), function(x) x*log(1/x)))  %>%
+  replace(is.na(.), 0) %>%
+  rowSums()
+}
+
+col_names = c("race_white_n", "race_aa_n", "race_aian_n", "race_asian_n", "race_nhopi_n", "race_other_n", "race_two_n")
+ca_data <- ca_data %>%
+  mutate(race_entropy = entropy_score(ca_data, col_names))
+
+ca_data
+```
+
+
+```{r}
+standardize <- function(x) {return( (x - mean(x)) / sd(x) )}
+
+#X_spatial <- model.matrix(~ inc_avg + pct_dem + smokers + adult_obesity 
+#                  + race_white_n + race_aa_n + race_hisp_n, data = ca_data)
+#X_spatial <- model.matrix(~ inc_avg + pct_dem, data = ca_data)
+X_spatial <- model.matrix(~ log_pop + sex_diff_n + sa_tot_60_up_n + avg_age + 
+                            race_white_n + race_aa_n + race_aian_n + race_hisp_n + race_entropy +
+                            avg_edu + fam_total_n + hs_occ_h + hs_owner_h + inc_avg + pct_dem +
+                            smokers + adult_obesity + inactive + drinking + uninsured, data = ca_data)
+
+X_spatial <- cbind(X_spatial[,1,drop=FALSE], apply(X_spatial[,-1], 2, standardize))
+E <- ca_data$pop
+W <- nb2mat(wQ, style = "B")
+
+```
+
+
+
+## BYM
+
+```{r}
+N <- nrow(X)
+adj_matrix = Matrix(W, "sparseMatrix")
+Q = Diagonal(N, rowSums(adj_matrix)) - adj_matrix
+Q_pert = Q + Diagonal(N) * max(diag(Q)) * sqrt(.Machine$double.eps)
+Q_inv = inla.qinv(Q_pert, constr=list(A = matrix(1, 1, N), e=0))
+scaling_factor = exp(mean(log(diag(Q_inv))))
+
+g <- graph.adjacency(adj_matrix)
+
+n1 <- get.edgelist(g)[,1]
+n2 <- get.edgelist(g)[,2]
+
+m1 <- numeric(length(n1)/2)
+m2 <- numeric(length(n1)/2)
+
+j = 1
+for (i in 1:length(n1)) {
+  if (n1[i] > n2[i]) {
+    m1[j] = n1[i]
+    m2[j] = n2[i]
+    j = j + 1
+  }
+}
+
+bym_data = list("N" = N,
+                "N_edges" = sum(W)/2,
+                "node1" = m1,
+                "node2" = m2,
+                "y" = ca_data$deaths_w,
+                "E" = ca_data$pop,
+                "K" = ncol(X),
+                "x" = X_spatial,
+                "scaling_factor" = scaling_factor)
+```
+
+```{r}
+bym_path <- paste0(stan_path, "bym2.stan")
+bym_model <- stan_model(bym_path)
+
+bym_fit = sampling(bym_model, data = bym_data, 
+                   chains = 4, cores = 4, iter = 5000, thin = 1, warmup = 4000,
+                   seed = 1234, save_warmup = FALSE, verbose = FALSE)
+```
+
+```{r}
+bym_nuts_params <- nuts_params(bym_fit)
+print(bym_fit, pars=c("betas", "rho", "sigma", "logit_rho", "mu[5]", "phi[5]", "theta[5]"), probs=c(0.025, 0.5, 0.975));
+```
+
+```{r}
+mcmc_pairs(bym_fit, pars = c("betas[1]", "betas[2]", "betas[3]", "rho", "sigma"), np = bym_nuts_params)
+```
+
+```{r}
+mcmc_nuts_energy(bym_nuts_params, binwidth = 5)
+```
+
+
+## AR-BYM
+
+```{r}
+county_data_daily_fname <- paste(work_dir, "/data/processed/county_data.csv", sep="")
+raw_data <- read_csv(county_data_daily_fname)
+
+county_data_daily <- raw_data %>%
+  filter(date > ymd("20200301") & date < ymd("20201130")) %>%
+  arrange(geoid) %>%
+  mutate(deaths = deaths_d,
+         cases = cases_d) %>%
+  select(all_of(c("geoid", "state_fips", "county_fips", "name", "date", "deaths", "cases")))
+```
+
+
+```{r}
+arbym_path <- paste0(stan_path, "negbin_hier_ar_bym2.stan")
+arbym_model <- stan_model(arbym_path)
+```
+
+```{r, hier_county_select, echo = FALSE, cache = TRUE, results = 'hide'}
+target_geoids <- county_data_daily %>%
+  filter(state_fips == "06") %>%
+  select(geoid) %>%
+  unique() %>%
+  c()
+target_geoids <- target_geoids$geoid
+
+#target_geoids <- c("06037", "06047", "06065", "06067", "06013", "06031", "06033", "06045",
+#                   "06087", "06097", "06099", "06103", "06113", "06003")
+target_geoids
+
+length(target_geoids)
+
+
+pops <- demographic_data %>%  
+  filter(geoid %in% target_geoids)
+```
+
+The data is different...
+
+```{r, hier_data, echo = FALSE, cache = TRUE, error = FALSE, warnings = FALSE, results = 'hide'}
+counters <- county_data_daily %>%
+  filter(geoid %in% target_geoids) %>%
+  group_by(geoid) %>%
+  summarize(total_deaths = sum(deaths), total_cases = sum(cases)) %>%
+  mutate(num = seq(1, length(total_deaths), 1),
+         ratio = total_deaths / total_cases,
+         inv_log_ratio = if_else(ratio == 0, 0, log(1/ratio)))
+
+y <- county_data_daily %>%
+  filter(geoid %in% target_geoids) %>%
+  select(geoid, date, deaths) %>%
+  pivot_wider(names_from = geoid, values_from = deaths) %>%
+  select(-date) %>%
+  as.matrix() %>%
+  t()
+
+X = county_data_daily %>%
+  filter(geoid %in% target_geoids) %>%
+  select(geoid, date, cases) %>%
+  pivot_wider(names_from = geoid, values_from = cases) %>%
+  select(-date) %>%
+  as.matrix()
+
+X <- abind(t(lag(X, 7)),
+           t(lag(X, 14)), along = 3)
+
+X[is.na(X)] <- 0
+
+counters
+```
+
+```{r, hier_fit, cache = TRUE, results = 'hide', echo = FALSE}
+arbym_data <- list(
+  "N" = dim(y)[1],
+  "T" = dim(y)[2],
+  
+  "y" = y,
+  
+  "inv_phi_alpha" = 5,
+  "inv_phi_beta" = 5,
+  
+  "K_time" = dim(X)[3],
+  "X_time" = X,
+  
+  "mu_betas_center" = c(-0, 0, 0, 0, 0, 0),
+  "mu_betas_scale" = c(0.2, 0.2, 0.2, 0.2, 0.2, 0.2),
+  "tau_betas_center" = c(0, 0, 0, 0, 0, 0),
+  "tau_betas_scale" = c(0.2, 0.2, 0.2, 0.2, 0.2, 0.2),
+  
+  "N_edges" = sum(W)/2,
+  "node1" = m1,
+  "node2" = m2,
+  "K_spatial" = ncol(X_spatial),
+  "X_spatial" = X_spatial,
+  "spatial_scaling_factor" = scaling_factor,
+  
+  "intercept_center" = -2,
+  "intercept_scale" = 2
+  
+)
+                
+arbym_fit = sampling(arbym_model, data = arbym_data, 
+               chains = 4, cores = 4, iter = 2000, thin = 1, warmup = 1000,
+               seed = 12345, save_warmup = FALSE)
+```
+
+
+```{r, hier_diagnostic}
+check_hmc_diagnostics(arbym_fit)
+```
+
+```{r, hier_summary, results = 'hide', echo = FALSE, cache = TRUE}
+arbym_fit_summary <- summary(arbym_fit, pars = c("inv_phi", "betas"))$summary
+arbym_fit_summary_spatial <- summary(arbym_fit, pars = c("phi_spatial", "theta_spatial"))$summary
+arbym_fit_summary_hier <- summary(arbym_fit, pars = c("eta", "rho", "sigma_spatial", "alphas", "mu_betas", "tau_betas", "Omega_betas"))$summary
+```
+
+```{r, hier_pairs, eval = FALSE, fig.width = 6, fig.height = 6, results = 'hide'}
+np = nuts_params(arbym_fit)
+mcmc_pairs(arbym_fit, pars = c("mu_betas[1]", "mu_betas[2]", "tau_betas[1]", "tau_betas[2]"), np = np)
+mcmc_pairs(arbym_fit, pars = c("mu_betas[3]", "mu_betas[4]", "tau_betas[3]", "tau_betas[4]"), np = np)
+mcmc_pairs(arbym_fit, pars = c("mu_betas[5]", "mu_betas[6]", "tau_betas[5]", "tau_betas[6]"), np = np)
+mcmc_pairs(arbym_fit, parc = c("Omega_betas[1,2]", "Omega_betas[1,3]", "Omega_betas[1,4]", 
+                                              "Omega_betas[1,5]", "Omega_betas[1,6]", "Omega_betas[1,7]"), np = np)
+```
+
+```{r}
+mcmc_nuts_energy(np, binwidth = 5)
+```
+
+```{r, hier_param_estimates1, warning = FALSE, cache = TRUE, echo = FALSE}
+arbym_fit_summary %>%
+  as_tibble(rownames = NA) %>%
+  mutate(Variable = rownames(.)) %>%
+  select(Variable, everything(), -se_mean) %>%
+  mutate_if(is.numeric, format, digits = 2, nsmall = 1) %>%
+  kbl() %>%
+  kable_classic(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+```{r, hier_param_estimates2, warning = FALSE, cache = TRUE, echo = FALSE}
+arbym_fit_summary_hier %>%
+  as_tibble(rownames = NA) %>%
+  mutate(Variable = rownames(.)) %>%
+  select(Variable, everything(), -se_mean) %>%
+  mutate(Variable = replace(Variable, str_detect(Variable, "alphas"), colnames(X_spatial))) %>%
+  mutate_if(is.numeric, round, digits = 3) %>%
+  mutate_if(is.numeric, format, scientific = FALSE, digits = 3, nsmall = 1) %>%
+  kbl() %>%
+  kable_classic(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+```
+
+```{r}
+colnames(X_spatial)
+```
+
+
+```{r, echo = FALSE, cache = TRUE, results = 'hide'}
+arbym_post <- rstan::extract(arbym_fit)
+```
+
+```{r, corr_2param_example, echo = FALSE, cache = TRUE}
+betas_means <- apply(arbym_post$betas, c(2,3), mean)
+
+as_tibble(betas_means) %>%
+  rename_with(function(x) str_replace(x, "V", "m")) %>%
+  ggplot(aes(x = m1, y = m4)) +
+  geom_point()
+```
+
+
+```{r, corr_plot, echo = FALSE, warnings = FALSE, cache = TRUE}
+Omega_means <- apply(arbym_post$Omega_betas, c(2,3), mean)
+Omega_sds <- apply(arbym_post$Omega_betas, c(2,3), sd)
+Omega_z <- Omega_means / Omega_sds
+diag(Omega_z) <- 0
+
+var_names <- c(`AR 1` = "1",
+               `Seasonal AR 1` = "2",
+               `Seasonal AR 2` = "3",
+               `Seasonal AR 3` = "4",
+               `Regression 1` = "5",
+               `Regression 2` = "6")
+
+Omega_df <- as_tibble(Omega_means) %>%
+  mutate(a1 = 1:6) %>%
+  pivot_longer(starts_with("V"), names_to = "a2", values_to = "z_score") %>%
+  mutate(a2 = as.integer(str_sub(a2, start=2))) %>% 
+  filter(a2 < a1) %>%
+  mutate(a1 = fct_recode(as.factor(a1), !!!var_names),
+         a2 = fct_recode(as.factor(a2), !!!var_names))
+
+ggplot(Omega_df, aes(x = a1, y  = a2, fill = z_score)) +
+  geom_tile() +
+  scale_fill_distiller(palette = "RdBu", limits = c(-1,1)*max(abs(Omega_df$z_score))) +
+  coord_equal() +
+  scale_y_discrete(position = "right") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 30, vjust = 1, hjust = 1)) +
+  theme(
+  axis.title.x = element_blank(),
+  axis.title.y = element_blank(),
+  panel.grid.major = element_blank(),
+  panel.border = element_blank(),
+  panel.background = element_blank(),
+  axis.ticks = element_blank(),
+  legend.justification = c(1, 0),
+  legend.position = c(0.45, 0.7),
+  legend.direction = "horizontal")+
+  guides(fill = guide_colorbar(barwidth = 7, barheight = 1,
+                title.position = "top", title.hjust = 0.5))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
