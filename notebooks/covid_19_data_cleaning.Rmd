@@ -21,7 +21,7 @@ The end goal is to have four separate tidy datasets: two that contain a unique i
 
 Along the way, we will deal with idiosyncrasies between how different data is collected, and with a small number of missing variables. This post is going to skip over the basics of data download and cleaning, and will take a more technical approach. At the end of the day, data cleaning isn't particularly exciting. Later posts will go much more in depth about the specific tools used and design decision that I make. If cleaning data in R is something you'd like to learn more about, Hadley Wickam's [R for Data Science](https://r4ds.had.co.nz) is the perfect resource.
 
-All of the code for this blogpost is available on [Github]().
+All of the code for this blogpost is available on [Github](https://github.com/jasonbossert/covid_analysis).
 
 We start by importing the libraries we will be using in R:
 

@@ -30,6 +30,8 @@ The importance of using specially designed models for timeseries lies in the typ
 
 A second challenge arises due to the count nature of our data. Most out-of-the-box statistical algorithms assume that the residuals of the model's prediction with respect to the actual data are normally distributed. For medium to large datasets, this is a surprisingly robust assumption, but breaks down for very small datasets, or datasets that are not unbounded and continuous. In our case, count data is bounded by zero on the low end (we can't have -1 death in a day), and is also an integer (we can't have 1.5 deaths in a day). For count data where the lowest count value is much larger than zero, we can often use algorithms that assume the residuals will be normally distributed. However, our datasets has many counts of zero, or close to zero, and our models will have to account for the fact that we are using count data. We will achieve this by introducing a Poisson and Negative-Binomial seasonal autoregressive model.
 
+This notebook and the associated Stan models can be found at [Github respository](https://github.com/jasonbossert/covid_analysis) for this project.
+
 ## Libraries and Data
 
 Before diving into any modelling, I will import the necessary libraries, and take a quick look at some data to make sure that the assumptions I made in the introduction are valid.
